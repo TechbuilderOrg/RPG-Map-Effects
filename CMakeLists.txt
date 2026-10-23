@@ -31,6 +31,7 @@ if(TARGET OBS::libobs)
   target_sources(rpg-map-effects PRIVATE
     src/plugin-main.cpp
     src/rpg_window.cpp
+    src/rpg_fog_source.cpp
     src/obs_display_widget.mm
     "${CURSOR_ASSETS_GENERATED}"
   )
@@ -122,6 +123,7 @@ else()
   target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     src/plugin-main.cpp
     src/rpg_window.cpp
+    src/rpg_fog_source.cpp
     src/obs_display_widget.mm
     "${CURSOR_ASSETS_GENERATED}"
   )

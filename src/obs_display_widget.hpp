@@ -5,6 +5,7 @@
 #include <QColor>
 
 #include <mutex>
+#include <vector>
 
 class QMouseEvent;
 class ArrowOverlay;
@@ -33,6 +34,14 @@ public:
 
     void setDirectionArrow(float fromX, float fromY, float toX, float toY);
     void clearDirectionArrow();
+
+    /** Scene item ids (in the displayed scene) of staged FX. They are hidden on output, so the
+     *  preview draws them itself as translucent "ghosts" with a marker. */
+    void setStagedItemIds(const std::vector<int64_t> &ids);
+
+    /** Fog tool overlays (preview only): round brush outline, or a rectangle being dragged. */
+    void setBrushOverlay(bool show, float x, float y, float radius);
+    void setRectOverlay(bool show, float x0, float y0, float x1, float y1);
 
     /** Convert canvas (scene) coordinates to widget coordinates for overlay drawing. */
     bool canvasToWidget(float canvasX, float canvasY, int widgetW, int widgetH,
@@ -67,6 +76,8 @@ private:
     void destroyDisplay();
 
     static void DrawCallback(void *data, uint32_t cx, uint32_t cy);
+    void drawStagedGhosts();
+    void drawToolOverlays();
 
     obs_display_t *display = nullptr;
     obs_source_t *sceneSource = nullptr;
@@ -85,6 +96,23 @@ private:
     float directionArrowToY_ = 0.0f;
 
     ArrowOverlay *arrowOverlay_ = nullptr;
+
+    mutable std::mutex overlayMutex_;
+    std::vector<int64_t> stagedItemIds_;
+    bool brushShow_ = false;
+    float brushX_ = 0.0f;
+    float brushY_ = 0.0f;
+    float brushRadius_ = 0.0f;
+    bool rectShow_ = false;
+    float rectX0_ = 0.0f;
+    float rectY0_ = 0.0f;
+    float rectX1_ = 0.0f;
+    float rectY1_ = 0.0f;
+
+    // Graphics thread only (destroyed in destroyDisplay).
+    gs_texrender_t *ghostTexrender_ = nullptr;
+    gs_effect_t *ghostEffect_ = nullptr;
+    bool ghostEffectFailed_ = false;
 
     QTimer *mousePollTimer_ = nullptr;
     bool mouseLeftDown_ = false;

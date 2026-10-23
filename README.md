@@ -8,6 +8,8 @@
 - **FX template scenes** (named `FX: Something`) you can spawn onto the map
 - **Sequenced FX** using `[250] name`–style delays
 - **Per‑template defaults** (fade, lifetime, label, sequencing)
+- **Staged FX**: place, move, rotate and resize effects while they are hidden from players, then trigger them
+- **Fog of war**: paint fog away (or back) per battlemap; players see solid fog, the GM sees through it
 
 Everything lives inside this plugin; it uses only public OBS APIs and does **not** require
 patching OBS core.
@@ -73,6 +75,30 @@ https://www.youtube.com/watch?v=U_O7mSwl27I
   - Right-click and select **Move**, the item will be locked to the mouse. Click to release and place the item. 
 
 -<img width="159" height="172" alt="SCR-20260305-mrxa" src="https://github.com/user-attachments/assets/7ec9264e-a90d-4a2d-870d-f9d9a5d8fd70" />
+
+- **Staged FX (set up a scene ahead of time)**
+  - Check **Stage hidden (place now, trigger later)** before spawning. The FX is added to the battlemap
+    but stays hidden on Program/stream output.
+  - In the plugin window, staged FX are drawn as translucent ghosts with an amber marker and are tagged
+    **STAGED** in the Active Effects list. Move, Rotate, Resize, labels, Lock and Clear all work as usual.
+  - Reveal them with **Trigger selected**, **Trigger all staged**, or **Trigger now** in the right‑click
+    menu (map or list). Sequencing (`[250] name`) and lifetime start at trigger time, not at spawn.
+  - OBS hotkeys (Settings → Hotkeys): **RPG Map Effects: Trigger all staged FX** and
+    **RPG Map Effects: Trigger next staged FX** (handy for a Stream Deck). Bindings are saved with the
+    scene collection.
+
+- **Fog of war**
+  - Check **Fog on this map** in the **Fog of War** box. A fog source named `RPG Fog: <map name>` is added
+    to the battlemap (locked, on top of the map and FX, below the cursor) and covers the whole map.
+  - Players see solid fog; the plugin window draws it see‑through (**GM view** %) so you can still read
+    the map and see FX/tokens under it.
+  - **Brush**: drag on the map to reveal (or **Hide** to paint fog back; hold **Alt** to flip
+    temporarily). Brush radius via the spin box or **[** / **]**.
+  - **Rectangle**: drag a rectangle to reveal a room; snaps to the grid when **Snap to grid** is on.
+  - **Undo** (Ctrl+Z / Cmd+Z), **Clear all** (reveal everything), **Cover all**.
+  - Fog color can be changed from the panel; the fog source's OBS properties also offer an optional fog
+    image, output opacity and GM view opacity. The revealed area is saved in the scene collection, so it
+    survives restarts. Each battlemap has its own fog.
 
  **Cursor overlay**
   - Right‑click on the map preview to access **Show cursor / Hide cursor** for the current battlemap.
@@ -171,7 +197,14 @@ See **[RELEASING.md](RELEASING.md)** for full steps, optional code signing/notar
    - Clear buttons support per‑effect fade‑out when configured.
    - Editing an effect’s label in the list updates the in‑scene label text (and keeps the configured label color). Labels start hidden by default; use context menus (FX list or map) to show/hide them.
 
-6. **Show or hide the cursor overlay**
+6. **Stage effects ahead of time (optional)**
+   - Check **Stage hidden**, spawn FX, then arrange them with Move / Rotate / Resize while players see nothing.
+   - Press **Trigger all staged** (or the hotkey) when the moment comes.
+
+7. **Use fog of war (optional)**
+   - Check **Fog on this map**, pick **Brush** or **Rectangle**, and drag to reveal areas as players explore.
+
+8. **Show or hide the cursor overlay**
    - Use the toolbar **Cursor** dropdown to choose a cursor style.
    - Right‑click on the map preview and choose **Show cursor** to add the cursor overlay to the current `Map:` scene; move the mouse over the preview to reposition it.
    - Right‑click again and choose **Hide cursor** to hide the cursor in that battlemap.

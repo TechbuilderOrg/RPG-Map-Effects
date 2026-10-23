@@ -1,6 +1,7 @@
 #include "rpg_window.hpp"
 #include "obs_display_widget.hpp"
 #include "cursor_assets.h"
+#include "rpg_fog_source.h"
 
 #include <cstdlib>
 #include <obs-module.h>
@@ -29,6 +30,8 @@
 #include <QMenu>
 #include <QStyledItemDelegate>
 #include <QPushButton>
+#include <QRadioButton>
+#include <QShortcut>
 #include <QScrollArea>
 #include <QSpinBox>
 #include <QStatusBar>
@@ -162,6 +165,8 @@ static uint32_t argbFromColor(const QColor &c)
 
 // Role for storing locked state in FX list items
 static constexpr int kFxItemLockedRole = Qt::UserRole;
+// Role for storing staged (hidden until triggered) state in FX list items
+static constexpr int kFxItemStagedRole = Qt::UserRole + 1;
 
 // Delegate that draws lock/unlock icon on the right of each FX list item
 class FxListDelegate : public QStyledItemDelegate {
@@ -188,6 +193,22 @@ public:
         painter->setFont(f);
         const QRect textRect = painter->boundingRect(rect, Qt::AlignRight | Qt::AlignVCenter, icon);
         painter->drawText(textRect, Qt::AlignRight | Qt::AlignVCenter, icon);
+
+        if (index.data(kFxItemStagedRole).toBool()) {
+            const QString tag = QStringLiteral("STAGED");
+            QFont tf = option.font;
+            tf.setBold(true);
+            tf.setPixelSize(qMin(rect.height() - 6, 10));
+            painter->setFont(tf);
+            const QRect tagArea = rect.adjusted(0, 0, -(textRect.width() + 6), 0);
+            QRect tagRect = painter->boundingRect(tagArea, Qt::AlignRight | Qt::AlignVCenter, tag);
+            tagRect.adjust(-3, -1, 3, 1);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(QColor(255, 160, 0));
+            painter->drawRoundedRect(tagRect, 3, 3);
+            painter->setPen(Qt::black);
+            painter->drawText(tagRect, Qt::AlignCenter, tag);
+        }
         painter->restore();
     }
 };
@@ -392,6 +413,11 @@ static void SetAllSceneItemsHiddenForSequenceHelper(void * /*param*/, obs_scene_
     obs_scene_enum_items(
         scene,
         [](obs_scene_t *, obs_sceneitem_t *item, void *) {
+            obs_source_t *src = obs_sceneitem_get_source(item);
+            const char *nm = src ? obs_source_get_name(src) : nullptr;
+            // Labels are never sequenced; keep whatever visibility the user gave them.
+            if (nm && QString::fromUtf8(nm).startsWith("FX Label "))
+                return true;
             obs_sceneitem_set_transition(item, false, nullptr); // clear hide transition → instant hide
             obs_sceneitem_set_visible(item, false);
             return true;
@@ -631,8 +657,111 @@ static void addGridToSceneAndSetVisible(obs_scene_t *scene, obs_source_t *gridSo
     obs_leave_graphics();
 }
 
+/** Move the fog (and then the cursor) above everything else so new FX stay under the fog. Scene lock held. */
+static void RaiseOverlaysInSceneLocked(obs_scene_t *scene)
+{
+    struct Ctx {
+        obs_sceneitem_t *fog = nullptr;
+        obs_sceneitem_t *cursor = nullptr;
+    } ctx;
+    obs_scene_enum_items(
+        scene,
+        [](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+            auto *ctx = static_cast<Ctx *>(param);
+            obs_source_t *src = obs_sceneitem_get_source(item);
+            if (rpg_is_fog_source(src)) {
+                ctx->fog = item;
+            } else {
+                const char *nm = src ? obs_source_get_name(src) : nullptr;
+                if (nm && strcmp(nm, kCursorSourceName) == 0)
+                    ctx->cursor = item;
+            }
+            return true;
+        },
+        &ctx);
+    if (ctx.fog)
+        obs_sceneitem_set_order(ctx.fog, OBS_ORDER_MOVE_TOP);
+    if (ctx.cursor)
+        obs_sceneitem_set_order(ctx.cursor, OBS_ORDER_MOVE_TOP);
+}
+
+struct AddFxItemData {
+    obs_source_t *fxSource = nullptr;
+    float x = 0.0f;
+    float y = 0.0f;
+    bool visible = true;
+    obs_sceneitem_t *outItem = nullptr;
+};
+
+/** Add the FX to the map with transform and visibility set in one atomic update, so output never
+ *  renders a frame of it at the wrong place or (when staged) visible at all. */
+static void AddFxItemHelper(void *param, obs_scene_t *scene)
+{
+    auto *data = static_cast<AddFxItemData *>(param);
+    obs_sceneitem_t *fxItem = obs_scene_add(scene, data->fxSource);
+    if (!fxItem)
+        return;
+    obs_sceneitem_set_visible(fxItem, data->visible);
+
+    vec2 pos;
+    vec2_set(&pos, data->x, data->y);
+    obs_sceneitem_set_alignment(fxItem, OBS_ALIGN_CENTER);
+    obs_sceneitem_set_pos(fxItem, &pos);
+
+    // Spawn in template's natural orientation (OBS 0° = right). Use Rotate to face up or other directions.
+    obs_sceneitem_set_rot(fxItem, 0.0f);
+
+    // Default: additive blend over the battlemap.
+    obs_sceneitem_set_blending_mode(fxItem, OBS_BLEND_ADDITIVE);
+
+    RaiseOverlaysInSceneLocked(scene);
+    data->outItem = fxItem;
+}
+
+/** Staged reveal using [ms] prefixes + per-item show transitions. Children must already be hidden. */
+static void ScheduleFxSequence(const QString &fxUuidQ)
+{
+    OBSSourceAutoRelease fxSource(obs_get_source_by_uuid(fxUuidQ.toUtf8().constData()));
+    obs_scene_t *fxScene = fxSource.Get() ? obs_scene_from_source(fxSource.Get()) : nullptr;
+    if (!fxScene)
+        return;
+
+    const std::vector<ChildItemSchedule> sched = BuildChildSchedule(fxScene);
+    for (const auto &entry : sched) {
+        QTimer::singleShot(entry.delayMs, qApp, [fxUuidQ, entry]() {
+            OBSSourceAutoRelease fxSrc(obs_get_source_by_uuid(fxUuidQ.toUtf8().constData()));
+            if (!fxSrc.Get())
+                return;
+            obs_scene_t *scene = obs_scene_from_source(fxSrc.Get());
+            if (!scene)
+                return;
+            obs_sceneitem_t *it = obs_scene_find_sceneitem_by_id(scene, entry.itemId);
+            if (!it)
+                return;
+            RestartMediaForSceneItem(it);
+            obs_sceneitem_set_visible(it, true);
+        });
+    }
+}
+
+/** Restart all media inside an FX scene (used when a staged FX without sequencing is triggered). */
+static void RestartAllMediaInFxScene(obs_scene_t *fxScene)
+{
+    if (!fxScene)
+        return;
+    obs_scene_enum_items(
+        fxScene,
+        [](obs_scene_t *, obs_sceneitem_t *item, void *) {
+            RestartMediaForSceneItem(item);
+            return true;
+        },
+        nullptr);
+}
+
+/** Spawn an FX instance. When staged, the FX is added hidden on output and its sequence is not
+ *  started; RPGWindow::triggerFx() reveals it later. */
 static void SpawnFxAtClick(const QString &templateSceneName, obs_source_t *mapSceneSource, float x, float y,
-                           bool sequenceByDelay, int defaultFadeMs,
+                           bool sequenceByDelay, bool staged, int defaultFadeMs,
                            const QString &labelText, uint32_t labelColorArgb,
                            QString &outMapSceneUuid, QString &outEffectUuid,
                            int64_t &outSceneItemId)
@@ -677,8 +806,10 @@ static void SpawnFxAtClick(const QString &templateSceneName, obs_source_t *mapSc
     // If sequencing, hide all children on the graphics thread: clear hide transitions first so we
     // don't trigger the template's fade-out (instant hide), then set invisible. Show transitions
     // stay so [time] fade-in still works. Doing this on the graphics thread avoids a "full on" frame.
+    // Staged FX keep their children visible so the GM preview shows the full effect; the sequence
+    // runs when the FX is triggered.
     obs_scene_t *fxSceneForChildren = obs_scene_from_source(dup);
-    if (sequenceByDelay && fxSceneForChildren)
+    if (sequenceByDelay && !staged && fxSceneForChildren)
         SetAllSceneItemsHiddenForSequenceOnGraphicsThread(fxSceneForChildren);
 
         // Add a text label inside the FX scene so it moves with the effect.
@@ -742,7 +873,15 @@ static void SpawnFxAtClick(const QString &templateSceneName, obs_source_t *mapSc
             }
         }
 
-    obs_sceneitem_t *fxItem = obs_scene_add(mapScene, dup);
+    AddFxItemData addData;
+    addData.fxSource = dup;
+    addData.x = x;
+    addData.y = y;
+    addData.visible = !staged;
+    obs_enter_graphics();
+    obs_scene_atomic_update(mapScene, AddFxItemHelper, &addData);
+    obs_leave_graphics();
+    obs_sceneitem_t *fxItem = addData.outItem;
 
     // The scene now owns it; drop our strong ref.
     obs_source_release(dup);
@@ -751,17 +890,6 @@ static void SpawnFxAtClick(const QString &templateSceneName, obs_source_t *mapSc
         return;
 
     outSceneItemId = obs_sceneitem_get_id(fxItem);
-
-    vec2 pos;
-    vec2_set(&pos, x, y);
-    obs_sceneitem_set_alignment(fxItem, OBS_ALIGN_CENTER);
-    obs_sceneitem_set_pos(fxItem, &pos);
-
-    // Spawn in template's natural orientation (OBS 0° = right). Use Rotate to face up or other directions.
-    obs_sceneitem_set_rot(fxItem, 0.0f);
-
-    // Default: additive blend over the battlemap.
-    obs_sceneitem_set_blending_mode(fxItem, OBS_BLEND_ADDITIVE);
 
     // Configure an automatic fade-out hide transition on the FX scene item.
     if (defaultFadeMs > 0) {
@@ -790,31 +918,8 @@ static void SpawnFxAtClick(const QString &templateSceneName, obs_source_t *mapSc
         }
     }
 
-    // Optional: staged reveal using [ms] prefixes + per-item show transitions.
-    if (sequenceByDelay) {
-        obs_source_t *fxSource = obs_sceneitem_get_source(fxItem);
-        obs_scene_t *fxScene = obs_scene_from_source(fxSource);
-        if (fxScene) {
-            const std::vector<ChildItemSchedule> sched = BuildChildSchedule(fxScene);
-            const QString fxUuidQ = outEffectUuid;
-
-            for (const auto &entry : sched) {
-                QTimer::singleShot(entry.delayMs, qApp, [fxUuidQ, entry]() {
-                    OBSSourceAutoRelease fxSrc(obs_get_source_by_uuid(fxUuidQ.toUtf8().constData()));
-                    if (!fxSrc.Get())
-                        return;
-                    obs_scene_t *scene = obs_scene_from_source(fxSrc.Get());
-                    if (!scene)
-                        return;
-                    obs_sceneitem_t *it = obs_scene_find_sceneitem_by_id(scene, entry.itemId);
-                    if (!it)
-                        return;
-                    RestartMediaForSceneItem(it);
-                    obs_sceneitem_set_visible(it, true);
-                });
-            }
-        }
-    }
+    if (sequenceByDelay && !staged)
+        ScheduleFxSequence(outEffectUuid);
 }
 
 // --- FX label helpers (DefaultLabelFromTemplateName above used for spawn placeholder) ---
@@ -921,6 +1026,8 @@ void RPGWindow::fadeOutAndRemoveInstance(const FxInstance &inst, int fadeMs)
     if (inst.mapSceneUuid.isEmpty() || inst.effectUuid.isEmpty() || inst.sceneItemId == 0)
         return;
 
+    releaseStagedShowing(inst.effectUuid);
+
     // Start hide (triggers any configured hide transitions).
     {
         OBSSourceAutoRelease mapSrc(obs_get_source_by_uuid(inst.mapSceneUuid.toUtf8().constData()));
@@ -993,27 +1100,30 @@ void RPGWindow::refreshFxListForCurrentMap()
     activeFx.clear();
     if (fxList)
         fxList->clear();
-    if (currentMapSceneUuid_.isEmpty())
-        return;
     auto it = fxByMapSceneUuid_.find(currentMapSceneUuid_);
-    if (it == fxByMapSceneUuid_.end())
+    if (currentMapSceneUuid_.isEmpty() || it == fxByMapSceneUuid_.end()) {
+        updateStagedOverlay();
         return;
-    const QString lockedPrefix = QStringLiteral("[Locked] ");
+    }
     for (const FxInstance &inst : it.value()) {
         activeFx.push_back(inst);
-        if (fxList) {
-            QString listText = inst.label.isEmpty() ? inst.templateName : inst.label;
-            if (listText.startsWith(lockedPrefix))
-                listText = listText.mid(lockedPrefix.size()).trimmed();
-            auto *item = new QListWidgetItem(listText);
-            item->setData(kFxItemLockedRole, inst.locked);
-            fxList->addItem(item);
-        }
+        if (fxList)
+            fxList->addItem(makeFxListItem(inst));
     }
-    if (fxList) {
-        for (int i = 0; i < fxList->count(); ++i)
-            fxList->item(i)->setFlags(fxList->item(i)->flags() | Qt::ItemIsEditable);
-    }
+    updateStagedOverlay();
+}
+
+QListWidgetItem *RPGWindow::makeFxListItem(const FxInstance &inst) const
+{
+    const QString lockedPrefix = QStringLiteral("[Locked] ");
+    QString listText = inst.label.isEmpty() ? inst.templateName : inst.label;
+    if (listText.startsWith(lockedPrefix))
+        listText = listText.mid(lockedPrefix.size()).trimmed();
+    auto *item = new QListWidgetItem(listText);
+    item->setFlags(item->flags() | Qt::ItemIsEditable);
+    item->setData(kFxItemLockedRole, inst.locked);
+    item->setData(kFxItemStagedRole, inst.staged);
+    return item;
 }
 
 bool RPGWindow::sameFx(const FxInstance &a, const FxInstance &b)
@@ -1123,6 +1233,298 @@ void RPGWindow::clearFxAtRow(int row, int fadeMs)
     activeFx.erase(activeFx.begin() + row);
     delete fxList->takeItem(row);
     releaseFxLockAndClearArrow();
+    updateStagedOverlay();
+}
+
+// --- Staged FX ---
+
+void RPGWindow::releaseStagedShowing(const QString &effectUuid)
+{
+    if (!stagedShowingUuids_.remove(effectUuid))
+        return;
+    OBSSourceAutoRelease fxSrc(obs_get_source_by_uuid(effectUuid.toUtf8().constData()));
+    if (fxSrc.Get())
+        obs_source_dec_showing(fxSrc.Get());
+}
+
+void RPGWindow::scheduleLifetime(const FxInstance &inst, int lifetimeSec, int fadeMs)
+{
+    if (lifetimeSec <= 0)
+        return;
+    QTimer::singleShot(lifetimeSec * 1000, this, [this, inst, fadeMs]() {
+        auto it = fxByMapSceneUuid_.find(inst.mapSceneUuid);
+        if (it == fxByMapSceneUuid_.end())
+            return;
+        std::vector<FxInstance> &vec = it.value();
+        for (size_t i = 0; i < vec.size(); ++i) {
+            if (sameFx(vec[i], inst)) {
+                fadeOutAndRemoveInstance(vec[i], fadeMs);
+                removeFxFromPerMapStore(inst);
+                if (inst.mapSceneUuid == currentMapSceneUuid_) {
+                    for (size_t j = 0; j < activeFx.size(); ++j) {
+                        if (sameFx(activeFx[j], inst)) {
+                            activeFx.erase(activeFx.begin() + (long)j);
+                            if (fxList)
+                                delete fxList->takeItem((int)j);
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    });
+}
+
+void RPGWindow::triggerFx(const FxInstance &instIn)
+{
+    if (!instIn.staged)
+        return;
+    const FxInstance inst = instIn; // copy: the stored entries are updated below
+    obs_sceneitem_t *item = getSceneItemForInstance(inst);
+    if (!item)
+        return;
+
+    OBSSourceAutoRelease fxSrc(obs_get_source_by_uuid(inst.effectUuid.toUtf8().constData()));
+    obs_scene_t *fxScene = fxSrc.Get() ? obs_scene_from_source(fxSrc.Get()) : nullptr;
+    if (inst.sequence && fxScene)
+        SetAllSceneItemsHiddenForSequenceOnGraphicsThread(fxScene);
+    else
+        RestartAllMediaInFxScene(fxScene);
+
+    obs_sceneitem_set_visible(item, true);
+    if (inst.sequence)
+        ScheduleFxSequence(inst.effectUuid);
+    releaseStagedShowing(inst.effectUuid);
+
+    auto mapIt = fxByMapSceneUuid_.find(inst.mapSceneUuid);
+    if (mapIt != fxByMapSceneUuid_.end()) {
+        for (FxInstance &stored : mapIt.value())
+            if (sameFx(stored, inst))
+                stored.staged = false;
+    }
+    for (size_t i = 0; i < activeFx.size(); ++i) {
+        if (sameFx(activeFx[i], inst)) {
+            activeFx[i].staged = false;
+            if (fxList && (int)i < fxList->count())
+                fxList->item((int)i)->setData(kFxItemStagedRole, false);
+        }
+    }
+
+    scheduleLifetime(inst, inst.lifetimeSec, inst.fadeMs);
+    updateStagedOverlay();
+}
+
+void RPGWindow::triggerAllStaged()
+{
+    std::vector<FxInstance> staged;
+    for (const FxInstance &inst : activeFx)
+        if (inst.staged)
+            staged.push_back(inst);
+    for (const FxInstance &inst : staged)
+        triggerFx(inst);
+}
+
+void RPGWindow::triggerNextStaged()
+{
+    for (const FxInstance &inst : activeFx) {
+        if (inst.staged) {
+            triggerFx(inst);
+            return;
+        }
+    }
+}
+
+void RPGWindow::updateStagedOverlay()
+{
+    std::vector<int64_t> ids;
+    for (const FxInstance &inst : activeFx)
+        if (inst.staged)
+            ids.push_back(inst.sceneItemId);
+    if (display)
+        display->setStagedItemIds(ids);
+    if (triggerAllBtn_) {
+        triggerAllBtn_->setText(ids.empty() ? QStringLiteral("Trigger all staged")
+                                            : QStringLiteral("Trigger all staged (%1)").arg(ids.size()));
+        triggerAllBtn_->setEnabled(!ids.empty());
+    }
+    if (triggerSelectedBtn_ && fxList) {
+        const int row = fxList->currentRow();
+        triggerSelectedBtn_->setEnabled(row >= 0 && row < (int)activeFx.size() &&
+                                        activeFx[static_cast<size_t>(row)].staged);
+    }
+}
+
+// --- Fog of war ---
+
+/** Fog item in the scene (addref'd; caller releases), or nullptr. */
+static obs_sceneitem_t *FindFogItemInScene(obs_scene_t *scene)
+{
+    obs_sceneitem_t *found = nullptr;
+    obs_scene_enum_items(
+        scene,
+        [](obs_scene_t *, obs_sceneitem_t *item, void *param) {
+            if (!rpg_is_fog_source(obs_sceneitem_get_source(item)))
+                return true;
+            obs_sceneitem_addref(item);
+            *static_cast<obs_sceneitem_t **>(param) = item;
+            return false;
+        },
+        &found);
+    return found;
+}
+
+static void AddFogItemHelper(void *param, obs_scene_t *scene)
+{
+    auto *fog = static_cast<obs_source_t *>(param);
+    obs_sceneitem_t *item = obs_scene_add(scene, fog);
+    if (!item)
+        return;
+    vec2 pos;
+    vec2_set(&pos, 0.0f, 0.0f);
+    obs_sceneitem_set_pos(item, &pos);
+    obs_sceneitem_set_alignment(item, OBS_ALIGN_LEFT | OBS_ALIGN_TOP);
+    // Brush coordinates assume the fog covers the canvas 1:1, so keep it from being dragged around.
+    obs_sceneitem_set_locked(item, true);
+    obs_sceneitem_set_visible(item, true);
+    RaiseOverlaysInSceneLocked(scene);
+}
+
+OBSSource RPGWindow::fogSourceForCurrentMap(bool create)
+{
+    if (!sceneCombo_)
+        return {};
+    const QString mapName = sceneCombo_->currentText();
+    OBSSourceAutoRelease sceneSrc = GetSceneSourceByName(mapName);
+    obs_scene_t *scene = sceneSrc.Get() ? obs_scene_from_source(sceneSrc.Get()) : nullptr;
+    if (!scene)
+        return {};
+
+    if (obs_sceneitem_t *item = FindFogItemInScene(scene)) {
+        OBSSource fog = obs_sceneitem_get_source(item);
+        obs_sceneitem_release(item);
+        return fog;
+    }
+    if (!create)
+        return {};
+
+    // Reuse a fog source left over from this map (e.g. removed from the scene), else make one.
+    const QString baseName = QStringLiteral("RPG Fog: %1").arg(mapName);
+    QString name = baseName;
+    OBSSourceAutoRelease fog;
+    for (int n = 2;; ++n) {
+        OBSSourceAutoRelease existing(obs_get_source_by_name(name.toUtf8().constData()));
+        if (!existing.Get()) {
+            fog = OBSSourceAutoRelease(obs_source_create(RPG_FOG_SOURCE_ID, name.toUtf8().constData(), nullptr, nullptr));
+            break;
+        }
+        if (rpg_is_fog_source(existing.Get())) {
+            fog = std::move(existing);
+            break;
+        }
+        name = QStringLiteral("%1 (%2)").arg(baseName).arg(n);
+    }
+    if (!fog.Get())
+        return {};
+
+    obs_enter_graphics();
+    obs_scene_atomic_update(scene, AddFogItemHelper, fog.Get());
+    obs_leave_graphics();
+    return OBSSource(fog.Get());
+}
+
+void RPGWindow::setFogEnabledForCurrentMap(bool enabled)
+{
+    if (enabled) {
+        currentFog_ = fogSourceForCurrentMap(true);
+    }
+    OBSSourceAutoRelease sceneSrc = GetSceneSourceByName(sceneCombo_ ? sceneCombo_->currentText() : QString());
+    obs_scene_t *scene = sceneSrc.Get() ? obs_scene_from_source(sceneSrc.Get()) : nullptr;
+    if (scene) {
+        if (obs_sceneitem_t *item = FindFogItemInScene(scene)) {
+            obs_sceneitem_set_visible(item, enabled);
+            obs_sceneitem_release(item);
+        }
+    }
+    if (!enabled)
+        setFogTool(FogTool::None);
+    syncFogUiForCurrentMap();
+}
+
+void RPGWindow::syncFogUiForCurrentMap()
+{
+    currentFog_ = fogSourceForCurrentMap(false);
+
+    bool visible = false;
+    OBSSourceAutoRelease sceneSrc = GetSceneSourceByName(sceneCombo_ ? sceneCombo_->currentText() : QString());
+    obs_scene_t *scene = sceneSrc.Get() ? obs_scene_from_source(sceneSrc.Get()) : nullptr;
+    if (scene) {
+        if (obs_sceneitem_t *item = FindFogItemInScene(scene)) {
+            visible = obs_sceneitem_visible(item);
+            obs_sceneitem_release(item);
+        }
+    }
+    if (fogEnableCheck_) {
+        const QSignalBlocker block(fogEnableCheck_);
+        fogEnableCheck_->setChecked(visible);
+    }
+    if (currentFog_.Get()) {
+        OBSDataAutoRelease settings = obs_source_get_settings(currentFog_.Get());
+        if (fogGmOpacitySpin_) {
+            const QSignalBlocker block(fogGmOpacitySpin_);
+            fogGmOpacitySpin_->setValue((int)obs_data_get_int(settings, "gm_opacity"));
+        }
+        if (fogColorBtn_) {
+            const uint32_t c = (uint32_t)obs_data_get_int(settings, "color");
+            fogColorBtn_->setIcon(iconFromColor(QColor(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff)));
+        }
+    }
+    if (!visible && fogTool_ != FogTool::None)
+        setFogTool(FogTool::None);
+}
+
+void RPGWindow::setFogTool(FogTool tool)
+{
+    if (tool != FogTool::None) {
+        // Painting needs fog on this map: turn it on rather than silently doing nothing.
+        if (!currentFog_.Get() || (fogEnableCheck_ && !fogEnableCheck_->isChecked()))
+            setFogEnabledForCurrentMap(true);
+        if (!currentFog_.Get())
+            tool = FogTool::None;
+        // Fog painting and click-to-spawn both use left click; the last one chosen wins.
+        if (spawnMode_ && spawnBtn_) {
+            spawnMode_ = false;
+            spawnBtn_->setChecked(false);
+            spawnLabel_->setText("Click to spawn");
+        }
+    }
+    fogTool_ = tool;
+    fogStrokeActive_ = false;
+    if (fogBrushBtn_)
+        fogBrushBtn_->setChecked(tool == FogTool::Brush);
+    if (fogRectBtn_)
+        fogRectBtn_->setChecked(tool == FogTool::Rect);
+    if (display) {
+        if (tool != FogTool::Brush)
+            display->setBrushOverlay(false, 0, 0, 0);
+        display->setRectOverlay(false, 0, 0, 0, 0);
+    }
+}
+
+bool RPGWindow::fogRevealMode() const
+{
+    const bool reveal = !fogRevealRadio_ || fogRevealRadio_->isChecked();
+    // Holding Alt temporarily inverts the mode (quick touch-ups without switching radio buttons).
+    return (QApplication::keyboardModifiers() & Qt::AltModifier) ? !reveal : reveal;
+}
+
+void RPGWindow::setFogSetting(const char *name, long long value)
+{
+    if (!currentFog_.Get())
+        return;
+    OBSDataAutoRelease settings = obs_data_create();
+    obs_data_set_int(settings, name, value);
+    obs_source_update(currentFog_.Get(), settings);
 }
 
 RPGWindow::RPGWindow()
@@ -1189,6 +1591,8 @@ RPGWindow::RPGWindow()
                          currentMapSceneUuid_ = getMapSceneUuidFromName(sceneName);
                          refreshFxListForCurrentMap();
                          releaseFxLockAndClearArrow();
+                         fogStrokeActive_ = false;
+                         syncFogUiForCurrentMap();
                          OBSSourceAutoRelease sceneSrc = GetSceneSourceByName(sceneName);
                          if (sceneSrc.Get())
                              obs_frontend_set_current_scene(sceneSrc.Get());
@@ -1366,6 +1770,34 @@ RPGWindow::RPGWindow()
                                 }
                             }
                         }
+                        // Fog tools: brush outline follows the mouse; dragging paints / sizes the rectangle.
+                        if (fogTool_ != FogTool::None && display) {
+                            const bool painting = fogStrokeActive_ && leftButtonDown;
+                            if (fogTool_ == FogTool::Brush) {
+                                const float r = fogBrushSpin_ ? float(fogBrushSpin_->value()) : 80.0f;
+                                display->setBrushOverlay(inside, x, y, r);
+                                if (painting && inside && currentFog_.Get()) {
+                                    rpg_fog_stroke(currentFog_.Get(), fogLastX_, fogLastY_, x, y, r, fogRevealMode());
+                                    fogLastX_ = x;
+                                    fogLastY_ = y;
+                                }
+                            } else if (fogTool_ == FogTool::Rect && painting && inside) {
+                                float x0 = std::min(fogRectX0_, x), x1 = std::max(fogRectX0_, x);
+                                float y0 = std::min(fogRectY0_, y), y1 = std::max(fogRectY0_, y);
+                                if (snapCheck->isChecked() && gridCellSpin->value() > 0) {
+                                    const float cell = static_cast<float>(gridCellSpin->value());
+                                    x0 = std::floor(x0 / cell) * cell;
+                                    y0 = std::floor(y0 / cell) * cell;
+                                    x1 = std::ceil(x1 / cell) * cell;
+                                    y1 = std::ceil(y1 / cell) * cell;
+                                }
+                                fogRectX1_ = x1;
+                                fogRectY1_ = y1;
+                                fogLastX_ = x0;
+                                fogLastY_ = y0;
+                                display->setRectOverlay(true, x0, y0, x1, y1);
+                            }
+                        }
                         // Move lock: FX center follows cursor (item has OBS_ALIGN_CENTER).
                          if (fxLockMode_ == FxLockMode::Move && display && fxList && inside) {
                              const int row = fxList->currentRow();
@@ -1470,6 +1902,16 @@ RPGWindow::RPGWindow()
     QObject::connect(display, &OBSDisplayWidget::sceneLeftReleased, this, [this]() {
                          if (fxLockMode_ != FxLockMode::None)
                              releaseFxLockAndClearArrow();
+                         if (fogStrokeActive_) {
+                             fogStrokeActive_ = false;
+                             if (fogTool_ == FogTool::Rect && currentFog_.Get()) {
+                                 // fogLast* holds the snapped top-left corner, fogRect*1 the bottom-right.
+                                 rpg_fog_rect(currentFog_.Get(), fogLastX_, fogLastY_, fogRectX1_, fogRectY1_,
+                                              fogRevealMode());
+                             }
+                             if (display)
+                                 display->setRectOverlay(false, 0, 0, 0, 0);
+                         }
                      });
 
     tb->addWidget(new QLabel("Cursor:", this));
@@ -1552,6 +1994,13 @@ RPGWindow::RPGWindow()
     auto *sequenceBox = new QCheckBox("Sequence [ms] with [123] prefixes", this);
     sequenceBox->setChecked(true);
     fxLayout->addWidget(sequenceBox);
+
+    auto *stageBox = new QCheckBox("Stage hidden (place now, trigger later)", this);
+    stageBox->setChecked(false);
+    stageBox->setToolTip(QStringLiteral(
+        "Spawned FX stay hidden from players. They show as translucent ghosts here so you can "
+        "move, rotate and resize them, then use Trigger to reveal them on output."));
+    fxLayout->addWidget(stageBox);
 
     auto *labelRowWidget = new QWidget(this);
     auto *labelRowLayout = new QHBoxLayout(labelRowWidget);
@@ -1697,6 +2146,147 @@ RPGWindow::RPGWindow()
 
     fxLayout->addWidget(fxList, /*stretch*/ 1);
 
+    auto *triggerRow = new QWidget(this);
+    auto *triggerRowLayout = new QHBoxLayout(triggerRow);
+    triggerRowLayout->setContentsMargins(0, 0, 0, 0);
+    triggerRowLayout->setSpacing(4);
+    triggerSelectedBtn_ = new QPushButton(QStringLiteral("Trigger selected"), this);
+    triggerSelectedBtn_->setToolTip(QStringLiteral("Reveal the selected staged FX on output"));
+    triggerAllBtn_ = new QPushButton(QStringLiteral("Trigger all staged"), this);
+    triggerAllBtn_->setToolTip(QStringLiteral(
+        "Reveal every staged FX on this map at once (also available as an OBS hotkey: "
+        "Settings → Hotkeys → \"RPG Map Effects: Trigger all staged FX\")"));
+    triggerAllBtn_->setStyleSheet("QPushButton:enabled { background-color: #e09000; color: black; font-weight: bold; }");
+    triggerRowLayout->addWidget(triggerSelectedBtn_);
+    triggerRowLayout->addWidget(triggerAllBtn_, 1);
+    fxLayout->addWidget(triggerRow);
+
+    QObject::connect(triggerSelectedBtn_, &QAbstractButton::clicked, this, [this]() {
+        const int row = fxList->currentRow();
+        if (row >= 0 && row < (int)activeFx.size())
+            triggerFx(activeFx[static_cast<size_t>(row)]);
+    });
+    QObject::connect(triggerAllBtn_, &QAbstractButton::clicked, this, [this]() { triggerAllStaged(); });
+
+    // --- Fog of war controls ---
+    auto *fogGroup = new QGroupBox(QStringLiteral("Fog of War"), this);
+    auto *fogLayout = new QGridLayout(fogGroup);
+    fogLayout->setContentsMargins(4, 8, 4, 4);
+    fogLayout->setHorizontalSpacing(4);
+    fogLayout->setVerticalSpacing(3);
+
+    fogEnableCheck_ = new QCheckBox(QStringLiteral("Fog on this map"), fogGroup);
+    fogEnableCheck_->setToolTip(QStringLiteral(
+        "Adds a fog layer to this battlemap. Players see solid fog; this window shows it "
+        "see-through so you can still read the map."));
+    fogColorBtn_ = new QToolButton(fogGroup);
+    fogColorBtn_->setIcon(iconFromColor(QColor(20, 20, 20)));
+    fogColorBtn_->setToolTip(QStringLiteral("Fog color (an image can be set in the fog source's properties)"));
+    fogColorBtn_->setFixedSize(kToolButtonSize, kToolButtonSize);
+    fogColorBtn_->setToolButtonStyle(Qt::ToolButtonIconOnly);
+    fogGmOpacitySpin_ = new QSpinBox(fogGroup);
+    fogGmOpacitySpin_->setRange(0, 100);
+    fogGmOpacitySpin_->setValue(45);
+    fogGmOpacitySpin_->setSuffix(QStringLiteral("%"));
+    fogGmOpacitySpin_->setToolTip(QStringLiteral("Fog opacity in this window only (output always uses the full fog)"));
+    auto *fogTopRow = new QHBoxLayout();
+    fogTopRow->setSpacing(4);
+    fogTopRow->addWidget(fogEnableCheck_, 1);
+    fogTopRow->addWidget(fogColorBtn_);
+    fogTopRow->addWidget(new QLabel(QStringLiteral("GM view:"), fogGroup));
+    fogTopRow->addWidget(fogGmOpacitySpin_);
+    fogLayout->addLayout(fogTopRow, 0, 0, 1, 3);
+
+    fogBrushBtn_ = new QPushButton(QStringLiteral("Brush"), fogGroup);
+    fogBrushBtn_->setCheckable(true);
+    fogBrushBtn_->setToolTip(QStringLiteral("Paint on the map to reveal or hide fog. [ and ] change the size."));
+    fogRectBtn_ = new QPushButton(QStringLiteral("Rectangle"), fogGroup);
+    fogRectBtn_->setCheckable(true);
+    fogRectBtn_->setToolTip(QStringLiteral("Drag a rectangle (snaps to the grid when Snap to grid is on)"));
+    fogRevealRadio_ = new QRadioButton(QStringLiteral("Reveal"), fogGroup);
+    fogRevealRadio_->setChecked(true);
+    auto *fogHideRadio = new QRadioButton(QStringLiteral("Hide"), fogGroup);
+    fogHideRadio->setToolTip(QStringLiteral("Paint fog back over the map (hold Alt to switch temporarily)"));
+    fogLayout->addWidget(fogBrushBtn_, 1, 0);
+    fogLayout->addWidget(fogRectBtn_, 1, 1);
+
+    fogBrushSpin_ = new QSpinBox(fogGroup);
+    fogBrushSpin_->setRange(5, 1000);
+    fogBrushSpin_->setSingleStep(10);
+    fogBrushSpin_->setValue(80);
+    fogBrushSpin_->setSuffix(QStringLiteral(" px"));
+    fogBrushSpin_->setToolTip(QStringLiteral("Brush radius"));
+    auto *fogUndoBtn = new QPushButton(QStringLiteral("Undo"), fogGroup);
+    fogUndoBtn->setToolTip(QStringLiteral("Undo the last fog edit (Ctrl+Z / Cmd+Z)"));
+    auto *fogRevealAllBtn = new QPushButton(QStringLiteral("Clear all"), fogGroup);
+    fogRevealAllBtn->setToolTip(QStringLiteral("Remove all fog from this map"));
+    auto *fogCoverAllBtn = new QPushButton(QStringLiteral("Cover all"), fogGroup);
+    fogCoverAllBtn->setToolTip(QStringLiteral("Cover the whole map in fog again"));
+    fogLayout->addWidget(fogBrushSpin_, 1, 2);
+    fogLayout->addWidget(fogRevealRadio_, 2, 0);
+    fogLayout->addWidget(fogHideRadio, 2, 1);
+    fogLayout->addWidget(fogUndoBtn, 2, 2);
+    fogLayout->addWidget(fogRevealAllBtn, 3, 0);
+    fogLayout->addWidget(fogCoverAllBtn, 3, 1);
+    fxLayout->addWidget(fogGroup);
+
+    QObject::connect(fogEnableCheck_, &QCheckBox::toggled, this,
+                     [this](bool checked) { setFogEnabledForCurrentMap(checked); });
+    QObject::connect(fogBrushBtn_, &QAbstractButton::clicked, this, [this](bool checked) {
+        setFogTool(checked ? FogTool::Brush : FogTool::None);
+    });
+    QObject::connect(fogRectBtn_, &QAbstractButton::clicked, this, [this](bool checked) {
+        setFogTool(checked ? FogTool::Rect : FogTool::None);
+    });
+    QObject::connect(fogGmOpacitySpin_, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                     [this](int value) { setFogSetting("gm_opacity", value); });
+    QObject::connect(fogColorBtn_, &QAbstractButton::clicked, this, [this]() {
+        if (!currentFog_.Get())
+            setFogEnabledForCurrentMap(true);
+        if (!currentFog_.Get())
+            return;
+        OBSDataAutoRelease settings = obs_source_get_settings(currentFog_.Get());
+        const uint32_t c = (uint32_t)obs_data_get_int(settings, "color");
+        const QColor current(c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff, (c >> 24) & 0xff);
+        const QColor chosen =
+            QColorDialog::getColor(current, this, QStringLiteral("Choose fog color"), QColorDialog::ShowAlphaChannel);
+        if (!chosen.isValid())
+            return;
+        // OBS color properties are 0xAABBGGRR.
+        const uint32_t abgr = (uint32_t(chosen.alpha()) << 24) | (uint32_t(chosen.blue()) << 16) |
+                              (uint32_t(chosen.green()) << 8) | uint32_t(chosen.red());
+        setFogSetting("color", (long long)abgr);
+        fogColorBtn_->setIcon(iconFromColor(chosen));
+    });
+    auto fogUndo = [this]() {
+        if (currentFog_.Get())
+            rpg_fog_undo(currentFog_.Get());
+    };
+    QObject::connect(fogUndoBtn, &QAbstractButton::clicked, this, fogUndo);
+    QObject::connect(fogRevealAllBtn, &QAbstractButton::clicked, this, [this]() {
+        if (!currentFog_.Get())
+            return;
+        rpg_fog_begin_edit(currentFog_.Get());
+        rpg_fog_fill(currentFog_.Get(), true);
+    });
+    QObject::connect(fogCoverAllBtn, &QAbstractButton::clicked, this, [this]() {
+        if (!currentFog_.Get())
+            setFogEnabledForCurrentMap(true);
+        if (!currentFog_.Get())
+            return;
+        rpg_fog_begin_edit(currentFog_.Get());
+        rpg_fog_fill(currentFog_.Get(), false);
+    });
+
+    auto *undoShortcut = new QShortcut(QKeySequence::Undo, this);
+    QObject::connect(undoShortcut, &QShortcut::activated, this, fogUndo);
+    auto *brushSmaller = new QShortcut(QKeySequence(Qt::Key_BracketLeft), this);
+    QObject::connect(brushSmaller, &QShortcut::activated, this,
+                     [this]() { fogBrushSpin_->setValue(fogBrushSpin_->value() - 10); });
+    auto *brushBigger = new QShortcut(QKeySequence(Qt::Key_BracketRight), this);
+    QObject::connect(brushBigger, &QShortcut::activated, this,
+                     [this]() { fogBrushSpin_->setValue(fogBrushSpin_->value() + 10); });
+
     QObject::connect(fxList, &QListWidget::customContextMenuRequested, this,
                      [this, fxCombo, fadeSpin](const QPoint &pos) {
                          const int row = fxList->row(fxList->itemAt(pos));
@@ -1746,6 +2336,11 @@ RPGWindow::RPGWindow()
                          }
 
                          QMenu menu(this);
+                         QAction *triggerAct = nullptr;
+                         if (inst.staged) {
+                             triggerAct = menu.addAction(QStringLiteral("Trigger now (show to players)"));
+                             menu.addSeparator();
+                         }
                          auto *resetSizeAct = menu.addAction(QStringLiteral("Reset size"));
                          menu.addSeparator();
                          QAction *lockAct = nullptr;
@@ -1765,7 +2360,9 @@ RPGWindow::RPGWindow()
                              hideLabelAct = menu.addAction(QStringLiteral("Hide label"));
 
                          QAction *chosen = menu.exec(fxList->mapToGlobal(pos));
-                         if (chosen == resetSizeAct) {
+                         if (chosen && chosen == triggerAct) {
+                             triggerFx(inst);
+                         } else if (chosen == resetSizeAct) {
                              obs_sceneitem_t *item = getSceneItemForInstance(inst);
                              if (item) {
                                  struct vec2 scale;
@@ -1833,7 +2430,12 @@ RPGWindow::RPGWindow()
                          QAction *clearAct = nullptr;
                          QAction *showLabelAct = nullptr;
                          QAction *hideLabelAct = nullptr;
+                         QAction *triggerAct = nullptr;
                          if (overFx) {
+                             if (ctxInst && ctxInst->staged) {
+                                 triggerAct = menu.addAction(QStringLiteral("Trigger now (show to players)"));
+                                 menu.addSeparator();
+                             }
                              moveAct = menu.addAction(QStringLiteral("Move"));
                              rotateAct = menu.addAction(QStringLiteral("Rotate"));
                              resizeAct = menu.addAction(QStringLiteral("Resize"));
@@ -1944,7 +2546,9 @@ RPGWindow::RPGWindow()
                             }
                         } else if (overFx) {
                              const int row = idx;
-                             if (chosen == clearAct) {
+                             if (chosen && chosen == triggerAct && ctxInst) {
+                                 triggerFx(*ctxInst);
+                             } else if (chosen == clearAct) {
                                  clearFxAtRow(row, fadeSpin ? fadeSpin->value() : 600);
                              } else if (chosen == moveAct) {
                                  fxLockMode_ = FxLockMode::Move;
@@ -2000,6 +2604,7 @@ RPGWindow::RPGWindow()
                      });
 
     QObject::connect(fxList, &QListWidget::currentRowChanged, this, [this](int row) {
+        updateStagedOverlay();
         if (row < 0 || row >= (int)activeFx.size()) {
             releaseFxLockAndClearArrow();
             return;
@@ -2059,7 +2664,7 @@ RPGWindow::RPGWindow()
 
     QObject::connect(refreshBtn, &QAbstractButton::clicked, this, [refreshLists]() { refreshLists(); });
 
-    auto doSpawn = [this, fxCombo, sequenceBox, fadeSpin, lifetimeSpin, gridCellSpin, snapCheck](
+    auto doSpawn = [this, fxCombo, sequenceBox, stageBox, fadeSpin, lifetimeSpin, gridCellSpin, snapCheck](
                        float spawnX, float spawnY) {
         OBSSourceAutoRelease mapSrc(display->getSceneSourceRef());
         if (!mapSrc.Get())
@@ -2076,6 +2681,7 @@ RPGWindow::RPGWindow()
         int64_t sceneItemId = 0;
 
         const bool seq = sequenceBox->isChecked();
+        const bool staged = stageBox->isChecked();
 
         QString labelText = DefaultLabelFromTemplateName(fxCombo->currentText());
         if (labelEdit) {
@@ -2096,7 +2702,7 @@ RPGWindow::RPGWindow()
 
         const uint32_t labelArgb = argbFromColor(labelColor_);
 
-        SpawnFxAtClick(fxCombo->currentText(), mapSrc.Get(), spawnX, spawnY, seq,
+        SpawnFxAtClick(fxCombo->currentText(), mapSrc.Get(), spawnX, spawnY, seq, staged,
                        fadeSpin->value(), labelText, labelArgb,
                        mapUuid, fxUuid, sceneItemId);
 
@@ -2107,44 +2713,29 @@ RPGWindow::RPGWindow()
             inst.sceneItemId = sceneItemId;
             inst.templateName = fxCombo->currentText();
             inst.label = labelText;
+            inst.staged = staged;
+            inst.sequence = seq;
+            inst.lifetimeSec = lifetimeSpin->value();
+            inst.fadeMs = fadeSpin->value();
+            if (staged) {
+                // Keep the hidden FX "showing" so animated/media content plays in the GM preview.
+                OBSSourceAutoRelease fxSrc(obs_get_source_by_uuid(fxUuid.toUtf8().constData()));
+                if (fxSrc.Get()) {
+                    obs_source_inc_showing(fxSrc.Get());
+                    stagedShowingUuids_.insert(fxUuid);
+                }
+            }
             fxByMapSceneUuid_[mapUuid].push_back(inst);
             if (mapUuid == currentMapSceneUuid_) {
                 activeFx.push_back(inst);
-                const QString listText = inst.label.isEmpty() ? inst.templateName : inst.label;
-                auto *item = new QListWidgetItem(listText);
-                item->setFlags(item->flags() | Qt::ItemIsEditable);
-                item->setData(kFxItemLockedRole, false);
-                fxList->addItem(item);
+                fxList->addItem(makeFxListItem(inst));
                 fxList->setCurrentRow(fxList->count() - 1);
             }
 
-            const int lifetimeSec = lifetimeSpin->value();
-            if (lifetimeSec > 0) {
-                const int fadeMs = fadeSpin->value();
-                QTimer::singleShot(lifetimeSec * 1000, qApp, [this, inst, fadeMs]() {
-                    auto it = fxByMapSceneUuid_.find(inst.mapSceneUuid);
-                    if (it == fxByMapSceneUuid_.end())
-                        return;
-                    std::vector<FxInstance> &vec = it.value();
-                    for (size_t i = 0; i < vec.size(); ++i) {
-                        if (sameFx(vec[i], inst)) {
-                            fadeOutAndRemoveInstance(vec[i], fadeMs);
-                            removeFxFromPerMapStore(inst);
-                            if (inst.mapSceneUuid == currentMapSceneUuid_) {
-                                for (size_t j = 0; j < activeFx.size(); ++j) {
-                                    if (sameFx(activeFx[j], inst)) {
-                                        activeFx.erase(activeFx.begin() + (long)j);
-                                        if (fxList)
-                                            delete fxList->takeItem((int)j);
-                                        break;
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                });
-            }
+            // Staged FX start their lifetime when triggered.
+            if (!staged)
+                scheduleLifetime(inst, inst.lifetimeSec, inst.fadeMs);
+            updateStagedOverlay();
         }
 
         if (labelEdit)
@@ -2157,6 +2748,7 @@ RPGWindow::RPGWindow()
             spawnBtn_->setChecked(false);
             spawnLabel_->setText("Click to spawn");
         } else {
+            setFogTool(FogTool::None);
             spawnMode_ = true;
             spawnBtn_->setChecked(true);
             spawnLabel_->setText("Click spawn location");
@@ -2172,6 +2764,24 @@ RPGWindow::RPGWindow()
                          lastClickX = x;
                          lastClickY = y;
                          lastClickInside = inside;
+
+                         if (!spawnMode_ && fogTool_ != FogTool::None) {
+                             if (inside && currentFog_.Get()) {
+                                 rpg_fog_begin_edit(currentFog_.Get());
+                                 fogStrokeActive_ = true;
+                                 fogLastX_ = x;
+                                 fogLastY_ = y;
+                                 fogRectX0_ = x;
+                                 fogRectY0_ = y;
+                                 fogRectX1_ = x;
+                                 fogRectY1_ = y;
+                                 if (fogTool_ == FogTool::Brush) {
+                                     const float r = float(fogBrushSpin_->value());
+                                     rpg_fog_stroke(currentFog_.Get(), x, y, x, y, r, fogRevealMode());
+                                 }
+                             }
+                             return;
+                         }
 
                          if (spawnMode_ && inside) {
                              doSpawn(x, y);
@@ -2233,6 +2843,8 @@ RPGWindow::RPGWindow()
         obs_source_release(cur);
     }
 
+    syncFogUiForCurrentMap();
+    updateStagedOverlay();
 }
 
 OBSSource RPGWindow::ensureGridSource()
@@ -2388,8 +3000,17 @@ OBSSource RPGWindow::ensureCursorSource()
     return cursorSource_;
 }
 
+void RPGWindow::releaseSceneCollectionRefs()
+{
+    setFogTool(FogTool::None);
+    currentFog_ = nullptr;
+    gridSource_ = nullptr;
+    cursorSource_ = nullptr;
+}
+
 void RPGWindow::releaseOBSResources()
 {
+    currentFog_ = nullptr;
     if (display)
         display->releaseOBSResources();
 }

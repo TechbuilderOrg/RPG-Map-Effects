@@ -34,6 +34,7 @@ add_custom_command(
 target_sources(rpg-map-effects PRIVATE
   src/plugin-main.cpp
   src/rpg_window.cpp
+  src/rpg_fog_source.cpp
   src/obs_display_widget.mm
   "${CURSOR_ASSETS_GENERATED}"
 )
