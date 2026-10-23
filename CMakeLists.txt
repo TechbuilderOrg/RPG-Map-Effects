@@ -36,6 +36,13 @@ if(TARGET OBS::libobs)
     "${CURSOR_ASSETS_GENERATED}"
   )
 
+  if(NOT APPLE)
+    set_source_files_properties(src/obs_display_widget.mm PROPERTIES LANGUAGE CXX)
+    if(MSVC)
+      set_source_files_properties(src/obs_display_widget.mm PROPERTIES COMPILE_OPTIONS /TP)
+    endif()
+  endif()
+
   target_include_directories(rpg-map-effects PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
   )
@@ -74,7 +81,12 @@ else()
   # --- Standalone build (OBS plugin template) ---
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
-  project(${_name} VERSION ${_version} LANGUAGES C CXX OBJC OBJCXX)
+  # Objective-C(++) is only needed (and only available) on macOS.
+  if(APPLE)
+    project(${_name} VERSION ${_version} LANGUAGES C CXX OBJC OBJCXX)
+  else()
+    project(${_name} VERSION ${_version} LANGUAGES C CXX)
+  endif()
 
   option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" ON)
   option(ENABLE_QT "Use Qt functionality" ON)
@@ -127,6 +139,14 @@ else()
     src/obs_display_widget.mm
     "${CURSOR_ASSETS_GENERATED}"
   )
+
+  if(NOT APPLE)
+    # obs_display_widget.mm only uses Objective-C behind __APPLE__; build it as C++ elsewhere.
+    set_source_files_properties(src/obs_display_widget.mm PROPERTIES LANGUAGE CXX)
+    if(MSVC)
+      set_source_files_properties(src/obs_display_widget.mm PROPERTIES COMPILE_OPTIONS /TP)
+    endif()
+  endif()
 
   target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

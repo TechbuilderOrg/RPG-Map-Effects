@@ -4,6 +4,7 @@
 #include <QString>
 #include <QColor>
 
+#include <cstdint>
 #include <mutex>
 #include <vector>
 

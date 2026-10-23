@@ -107,6 +107,29 @@ https://www.youtube.com/watch?v=U_O7mSwl27I
 
 ---
 
+## Installing on Windows
+
+1. Download the `rpg-map-effects-<version>-windows-x64.zip` build (from the repository's **Actions** tab:
+   open the latest successful run and download the `...-windows-x64-...` artifact, or from **Releases**).
+2. Close OBS.
+3. Extract the zip into `C:\ProgramData\obs-studio\plugins\` so that you end up with
+   `C:\ProgramData\obs-studio\plugins\rpg-map-effects\bin\64bit\rpg-map-effects.dll`.
+4. Start OBS and open **Tools → RPG Map Effects**.
+
+The plugin is built against OBS 31.1, so use OBS Studio 31.1 or newer.
+
+### Building on Windows
+
+Requires Visual Studio 2022 (Desktop development with C++) and CMake 3.28+. From a Developer PowerShell:
+
+```powershell
+cmake --preset windows-x64
+cmake --build --preset windows-x64
+```
+
+The first configure downloads OBS sources, obs-deps and Qt per `buildspec.json`. The built plugin is under
+`build_x64\RelWithDebInfo`.
+
 ## Building (macOS)
 
 This repo uses the [OBS plugin template](https://github.com/obsproject/obs-plugintemplate) for **standalone** builds. You do not need to clone OBS Studio.

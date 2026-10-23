@@ -4,6 +4,7 @@
 #include "rpg_fog_source.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <obs-module.h>
 #include <obs.hpp>
 
@@ -44,7 +45,17 @@
 #include <QVBoxLayout>
 #include <QWidget>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <algorithm>
 #include <cmath>
 
@@ -59,15 +70,25 @@ extern "C" {
 // Compile-time stamp for this translation unit only
 static const char *kCompileStamp = __DATE__ " " __TIME__;
 
-// Anchor symbol so dladdr can locate the plugin binary on disk
+// Anchor symbol so dladdr / GetModuleHandleEx can locate the plugin binary on disk
 static void rpg_me_anchor_symbol() {}
 
 static QString GetPluginBinaryPath()
 {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&rpg_me_anchor_symbol), &module))
+        return {};
+    wchar_t path[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameW(module, path, MAX_PATH);
+    return len ? QString::fromWCharArray(path, int(len)) : QString();
+#else
     Dl_info info {};
     if (dladdr((void *)&rpg_me_anchor_symbol, &info) && info.dli_fname)
         return QString::fromUtf8(info.dli_fname);
     return {};
+#endif
 }
 
 static QString GetPluginMTimeString()
