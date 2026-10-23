@@ -40,6 +40,14 @@ https://www.youtube.com/watch?v=U_O7mSwl27I
     - Cell size (px)
     - Line width (px)
     - Color
+    - **Opacity** (applies to the preview and the on-output grid)
+    - **Align**: X/Y offset, or click **Click a square corner on the map** and then click any square
+      corner on your battlemap to line the grid up with the map's own squares
+  - Only whole squares are drawn, every line at full width (including the edges); a strip at the right or
+    bottom edge narrower than one square is left without grid. When the squares fill the canvas exactly,
+    the closing line sits just inside the edge.
+  - Snap to grid, the fog rectangle tool and the cell readout use the same layout.
+  - Grid settings are remembered between sessions.
   - **Show grid on output**:
     - Creates/ensures an image source named `RPG Map Grid`.
     - Renders a PNG at the base canvas size and adds it as a source to the selected battlemap scene.

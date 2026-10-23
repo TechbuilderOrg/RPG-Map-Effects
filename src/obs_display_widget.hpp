@@ -28,6 +28,12 @@ public:
     void setGridOverlay(bool show, int cellSizePx);
     void setGridColor(const QColor &color) { gridColor_ = color; }
     void setGridLineWidth(int pixels) { gridLineWidth_ = (pixels < 1) ? 1 : ((pixels > 10) ? 10 : pixels); }
+    void setGridOffset(int x, int y)
+    {
+        gridOffsetX_ = x;
+        gridOffsetY_ = y;
+    }
+    void setGridOpacity(int percent) { gridOpacity_ = (percent < 0) ? 0 : ((percent > 100) ? 100 : percent); }
     bool gridVisible() const { return gridShow_; }
     int gridCellSize() const { return gridCellSize_; }
     int gridLineWidth() const { return gridLineWidth_; }
@@ -87,6 +93,9 @@ private:
     bool gridShow_ = false;
     int gridCellSize_ = 50;
     int gridLineWidth_ = 1;
+    int gridOffsetX_ = 0;
+    int gridOffsetY_ = 0;
+    int gridOpacity_ = 100;
     QColor gridColor_ = QColor(96, 96, 96, 255);
 
     mutable std::mutex directionArrowMutex_;

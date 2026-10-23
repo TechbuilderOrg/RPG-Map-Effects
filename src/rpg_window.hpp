@@ -8,6 +8,8 @@
 
 #include <obs.hpp>
 
+#include "grid_layout.h"
+
 class OBSDisplayWidget;
 class QCheckBox;
 class QComboBox;
@@ -41,7 +43,8 @@ public:
 
 private:
     OBSSource ensureGridSource();
-    void updateGridSourceSettings(obs_source_t *gridSource, int cellSize, int lineWidth, const QColor &color);
+    /** Regenerate the output grid image from the current grid settings and reload the grid source. */
+    void updateGridSourceSettings(obs_source_t *gridSource);
     void syncGridOutputToScene(const QString &sceneName, bool showOnOutput);
 
     struct FxInstance {
@@ -63,6 +66,20 @@ private:
 
 private:
     OBSDisplayWidget *display = nullptr;
+
+    // Grid settings (toolbar). Saved to the module config so they survive restarts.
+    QSpinBox *gridCellSpin_ = nullptr;
+    QSpinBox *gridWidthSpin_ = nullptr;
+    QSpinBox *gridOpacitySpin_ = nullptr;
+    QSpinBox *gridOffsetXSpin_ = nullptr;
+    QSpinBox *gridOffsetYSpin_ = nullptr;
+    QFrame *gridAlignPopup_ = nullptr;
+    /** Next left click on the map sets the grid offset so a grid corner lands there. */
+    bool gridAlignMode_ = false;
+    /** Layout of the grid on the current canvas (shared by output image, preview and snapping). */
+    GridLayout gridLayout() const;
+    void loadGridSettings();
+    void saveGridSettings() const;
 
     QColor labelColor_ = Qt::white;
 

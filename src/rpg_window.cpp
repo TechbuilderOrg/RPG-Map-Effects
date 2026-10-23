@@ -474,25 +474,28 @@ static QString GetGridPngPath()
     return QDir::temp().absoluteFilePath(QStringLiteral("rpg_map_effects_grid.png"));
 }
 
-static bool GenerateGridPng(const QString &path, int width, int height, const QColor &color,
-                            int cellSize, int lineWidth)
+/** Render the output grid image: full-width line bands around whole squares only (see GridLayout). */
+static bool GenerateGridPng(const QString &path, const GridLayout &grid, const QColor &color)
 {
-    if (width < 1 || height < 1 || cellSize < 10 || lineWidth < 1 || lineWidth > 10)
+    if (grid.canvasW < 1 || grid.canvasH < 1 || grid.cell < 10 || grid.lineWidth < 1 || grid.lineWidth > 10)
         return false;
 
-    QImage img(width, height, QImage::Format_ARGB32);
+    QImage img(grid.canvasW, grid.canvasH, QImage::Format_ARGB32);
     img.fill(Qt::transparent);
 
-    QPainter p(&img);
-    p.setRenderHint(QPainter::Antialiasing, false);
-    p.setPen(QPen(color, lineWidth, Qt::SolidLine, Qt::SquareCap));
-
-    for (int x = 0; x <= width; x += cellSize)
-        p.drawLine(x, 0, x, height);
-    for (int y = 0; y <= height; y += cellSize)
-        p.drawLine(0, y, width, y);
-
-    p.end();
+    if (grid.valid()) {
+        QPainter p(&img);
+        p.setRenderHint(QPainter::Antialiasing, false);
+        // Source mode: overlapping bands at the crossings keep the chosen opacity instead of doubling it.
+        p.setCompositionMode(QPainter::CompositionMode_Source);
+        const int top = grid.lineY(0), height = grid.bottom() - top;
+        const int left = grid.lineX(0), width = grid.right() - left;
+        for (int k = 0; k <= grid.cols(); ++k)
+            p.fillRect(grid.lineX(k), top, grid.lineWidth, height, color);
+        for (int k = 0; k <= grid.rows(); ++k)
+            p.fillRect(left, grid.lineY(k), width, grid.lineWidth, color);
+        p.end();
+    }
 
     return img.save(path, "PNG");
 }
@@ -1625,7 +1628,7 @@ RPGWindow::RPGWindow()
     gridCheck->setChecked(false);
     tb->addWidget(gridCheck);
 
-    auto *gridCellSpin = new QSpinBox(this);
+    auto *gridCellSpin = gridCellSpin_ = new QSpinBox(this);
     gridCellSpin->setRange(10, 500);
     gridCellSpin->setSingleStep(10);
     gridCellSpin->setValue(50);
@@ -1639,12 +1642,61 @@ RPGWindow::RPGWindow()
     gridColorBtn->setToolButtonStyle(Qt::ToolButtonIconOnly);
     tb->addWidget(gridColorBtn);
 
-    auto *gridWidthSpin = new QSpinBox(this);
+    auto *gridWidthSpin = gridWidthSpin_ = new QSpinBox(this);
     gridWidthSpin->setRange(1, 10);
     gridWidthSpin->setValue(1);
     gridWidthSpin->setSuffix(" px");
     tb->addWidget(new QLabel("Line:", this));
     tb->addWidget(gridWidthSpin);
+
+    auto *gridOpacitySpin = gridOpacitySpin_ = new QSpinBox(this);
+    gridOpacitySpin->setRange(5, 100);
+    gridOpacitySpin->setSingleStep(5);
+    gridOpacitySpin->setValue(100);
+    gridOpacitySpin->setSuffix("%");
+    gridOpacitySpin->setToolTip(QStringLiteral("Grid line opacity (preview and output)"));
+    tb->addWidget(new QLabel("Opacity:", this));
+    tb->addWidget(gridOpacitySpin);
+
+    // Alignment: offset the grid so its squares line up with the squares printed on the map.
+    auto *gridAlignBtn = new QPushButton(QStringLiteral("Align"), this);
+    gridAlignBtn->setToolTip(QStringLiteral("Line the grid up with the squares on your map"));
+    tb->addWidget(gridAlignBtn);
+    gridAlignPopup_ = new QFrame(this, Qt::Popup);
+    gridAlignPopup_->setFrameStyle(QFrame::StyledPanel);
+    {
+        auto *alignLayout = new QGridLayout(gridAlignPopup_);
+        alignLayout->setContentsMargins(8, 8, 8, 8);
+        gridOffsetXSpin_ = new QSpinBox(gridAlignPopup_);
+        gridOffsetYSpin_ = new QSpinBox(gridAlignPopup_);
+        for (QSpinBox *spin : {gridOffsetXSpin_, gridOffsetYSpin_}) {
+            spin->setRange(0, 499);
+            spin->setSuffix(" px");
+        }
+        auto *clickAlignBtn = new QPushButton(QStringLiteral("Click a square corner on the map"), gridAlignPopup_);
+        clickAlignBtn->setToolTip(QStringLiteral("Then click the corner of any square on your map; the grid snaps to it"));
+        auto *resetAlignBtn = new QPushButton(QStringLiteral("Reset"), gridAlignPopup_);
+        alignLayout->addWidget(new QLabel(QStringLiteral("Offset X:"), gridAlignPopup_), 0, 0);
+        alignLayout->addWidget(gridOffsetXSpin_, 0, 1);
+        alignLayout->addWidget(new QLabel(QStringLiteral("Offset Y:"), gridAlignPopup_), 1, 0);
+        alignLayout->addWidget(gridOffsetYSpin_, 1, 1);
+        alignLayout->addWidget(clickAlignBtn, 2, 0, 1, 2);
+        alignLayout->addWidget(resetAlignBtn, 3, 0, 1, 2);
+        QObject::connect(clickAlignBtn, &QAbstractButton::clicked, this, [this]() {
+            gridAlignMode_ = true;
+            gridAlignPopup_->close();
+            statusBar()->showMessage(QStringLiteral("Click the corner of a square on the map to align the grid"), 8000);
+        });
+        QObject::connect(resetAlignBtn, &QAbstractButton::clicked, this, [this]() {
+            gridOffsetXSpin_->setValue(0);
+            gridOffsetYSpin_->setValue(0);
+        });
+    }
+    QObject::connect(gridAlignBtn, &QAbstractButton::clicked, this, [this, gridAlignBtn]() {
+        gridAlignPopup_->adjustSize();
+        gridAlignPopup_->move(gridAlignBtn->mapToGlobal(QPoint(0, gridAlignBtn->height())));
+        gridAlignPopup_->show();
+    });
 
     auto *snapCheck = new QCheckBox("Snap to grid", this);
     snapCheck->setChecked(false);
@@ -1668,49 +1720,43 @@ RPGWindow::RPGWindow()
     statusBar()->addPermanentWidget(clickLabel, 1);
     statusBar()->addPermanentWidget(verLabel, 0);
 
-    auto updateGridOverlay = [this, gridCheck, gridCellSpin, gridWidthSpin]() {
-        display->setGridOverlay(gridCheck->isChecked(), gridCellSpin->value());
+    auto updateGridOverlay = [this, gridCheck, gridCellSpin, gridWidthSpin, gridOnOutputCheck]() {
+        // With the grid on output, the preview already shows that grid; drawing the preview grid
+        // on top would double the lines and make them look more opaque than on stream.
+        display->setGridOverlay(gridCheck->isChecked() && !gridOnOutputCheck->isChecked(), gridCellSpin->value());
         display->setGridLineWidth(gridWidthSpin->value());
+        display->setGridOpacity(gridOpacitySpin_->value());
+        display->setGridOffset(gridOffsetXSpin_->value(), gridOffsetYSpin_->value());
     };
     QObject::connect(gridCheck, &QCheckBox::toggled, this, [updateGridOverlay](bool) { updateGridOverlay(); });
-    QObject::connect(gridCellSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [updateGridOverlay](int) { updateGridOverlay(); });
-    QObject::connect(gridWidthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [updateGridOverlay](int) { updateGridOverlay(); });
+    QObject::connect(gridOnOutputCheck, &QCheckBox::toggled, this, [updateGridOverlay](bool) { updateGridOverlay(); });
+    for (QSpinBox *spin : {gridCellSpin, gridWidthSpin, gridOpacitySpin, gridOffsetXSpin_, gridOffsetYSpin_}) {
+        QObject::connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, updateGridOverlay](int) {
+            updateGridOverlay();
+            saveGridSettings();
+        });
+    }
 
-    auto syncGridOutput = [this, gridOnOutputCheck, gridCellSpin, gridWidthSpin]() {
+    auto syncGridOutput = [this, gridOnOutputCheck]() {
         if (!gridOnOutputCheck->isChecked())
             return;
         ensureGridSource();
         if (gridSource_.Get()) {
-            updateGridSourceSettings(gridSource_.Get(), gridCellSpin->value(),
-                                     gridWidthSpin->value(), display->gridColor());
+            updateGridSourceSettings(gridSource_.Get());
             syncGridOutputToScene(sceneCombo_->currentText(), true);
         }
     };
 
     QObject::connect(gridOnOutputCheck, &QCheckBox::toggled, this,
-                     [this, gridOnOutputCheck, gridCellSpin, gridWidthSpin](bool checked) {
+                     [this](bool checked) {
                          const QString sceneName = sceneCombo_->currentText();
-                         QTimer::singleShot(0, this, [this, checked, sceneName, gridCellSpin,
-                                                       gridWidthSpin]() {
+                         QTimer::singleShot(0, this, [this, checked, sceneName]() {
                              if (checked) {
-                                 obs_video_info ovi = {};
-                                 const bool haveVideo = obs_get_video_info(&ovi) && ovi.base_width > 0 && ovi.base_height > 0;
-                                 const int w = haveVideo ? (int)ovi.base_width : 1920;
-                                 const int h = haveVideo ? (int)ovi.base_height : 1080;
-
-                                 const QString path = GetGridPngPath();
-                                 if (GenerateGridPng(path, w, h, display->gridColor(),
-                                                     gridCellSpin->value(),
-                                                     gridWidthSpin->value())) {
-                                     ensureGridSource();
-                                     if (gridSource_.Get()) {
-                                         updateGridSourceSettings(gridSource_.Get(),
-                                                                  gridCellSpin->value(),
-                                                                  gridWidthSpin->value(),
-                                                                  display->gridColor());
-                                         syncGridOutputToScene(sceneName, true);
-                                         blog(LOG_INFO, "[rpg-map-effects] Grid on output: added to scene \"%s\".", sceneName.toUtf8().constData());
-                                     }
+                                 ensureGridSource();
+                                 if (gridSource_.Get()) {
+                                     updateGridSourceSettings(gridSource_.Get());
+                                     syncGridOutputToScene(sceneName, true);
+                                     blog(LOG_INFO, "[rpg-map-effects] Grid on output: added to scene \"%s\".", sceneName.toUtf8().constData());
                                  }
                              } else {
                                  syncGridOutputToScene(sceneName, false);
@@ -1723,19 +1769,30 @@ RPGWindow::RPGWindow()
     // Grid is only added/updated when the user checks "Show grid on output" or changes grid settings.
     // To get the grid on a different battlemap, uncheck then check "Show grid on output" after switching.
 
-    QObject::connect(gridCellSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
-                     [syncGridOutput](int) { syncGridOutput(); });
-    QObject::connect(gridWidthSpin, QOverload<int>::of(&QSpinBox::valueChanged), this,
-                     [syncGridOutput](int) { syncGridOutput(); });
+    for (QSpinBox *spin : {gridCellSpin, gridWidthSpin, gridOpacitySpin, gridOffsetXSpin_, gridOffsetYSpin_})
+        QObject::connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                         [syncGridOutput](int) { syncGridOutput(); });
     QObject::connect(gridColorBtn, &QAbstractButton::clicked, this, [this, gridColorBtn, syncGridOutput]() {
         const QColor current = display->gridColor();
         QColor chosen = QColorDialog::getColor(current, this, "Choose grid color");
         if (chosen.isValid()) {
             display->setGridColor(chosen);
             gridColorBtn->setIcon(iconFromColor(chosen));
+            saveGridSettings();
             syncGridOutput();
         }
     });
+
+    // Restore the last grid settings (signals blocked: nothing is on output yet).
+    {
+        for (QSpinBox *spin : {gridCellSpin, gridWidthSpin, gridOpacitySpin, gridOffsetXSpin_, gridOffsetYSpin_})
+            spin->blockSignals(true);
+        loadGridSettings();
+        for (QSpinBox *spin : {gridCellSpin, gridWidthSpin, gridOpacitySpin, gridOffsetXSpin_, gridOffsetYSpin_})
+            spin->blockSignals(false);
+        gridColorBtn->setIcon(iconFromColor(display->gridColor()));
+        updateGridOverlay();
+    }
 
     QObject::connect(display, &OBSDisplayWidget::sceneMouseMoved, this,
                      [this, mouseLabel, gridCheck, gridCellSpin, snapCheck](float x, float y,
@@ -1765,10 +1822,8 @@ RPGWindow::RPGWindow()
                                             .arg(nnx, 0, 'f', 4)
                                             .arg(nny, 0, 'f', 4);
                                  if (gridCheck->isChecked() && gridCellSpin->value() > 0) {
-                                     const int cell = gridCellSpin->value();
-                                     const int col = static_cast<int>(std::floor(x / cell));
-                                     const int row = static_cast<int>(std::floor(y / cell));
-                                     text += QString("  |  cell (%1, %2)").arg(col).arg(row);
+                                     const GridLayout grid = gridLayout();
+                                     text += QString("  |  cell (%1, %2)").arg(grid.colAt(x)).arg(grid.rowAt(y));
                                  }
                              }
                              mouseLabel->setText(text);
@@ -1805,12 +1860,10 @@ RPGWindow::RPGWindow()
                             } else if (fogTool_ == FogTool::Rect && painting && inside) {
                                 float x0 = std::min(fogRectX0_, x), x1 = std::max(fogRectX0_, x);
                                 float y0 = std::min(fogRectY0_, y), y1 = std::max(fogRectY0_, y);
-                                if (snapCheck->isChecked() && gridCellSpin->value() > 0) {
-                                    const float cell = static_cast<float>(gridCellSpin->value());
-                                    x0 = std::floor(x0 / cell) * cell;
-                                    y0 = std::floor(y0 / cell) * cell;
-                                    x1 = std::ceil(x1 / cell) * cell;
-                                    y1 = std::ceil(y1 / cell) * cell;
+                                if (snapCheck->isChecked() && gridLayout().valid()) {
+                                    const GridLayout grid = gridLayout();
+                                    grid.snapSpanX(x0, x1);
+                                    grid.snapSpanY(y0, y1);
                                 }
                                 fogRectX1_ = x1;
                                 fogRectY1_ = y1;
@@ -1829,10 +1882,10 @@ RPGWindow::RPGWindow()
                                      OBSSourceAutoRelease mapSrc(obs_get_source_by_uuid(inst.mapSceneUuid.toUtf8().constData()));
                                      if (mapSrc.Get()) {
                                          float moveX = x, moveY = y;
-                                         if (snapCheck->isChecked() && gridCellSpin->value() > 0) {
-                                             const float cell = static_cast<float>(gridCellSpin->value());
-                                             moveX = (std::floor(x / cell) + 0.5f) * cell;
-                                             moveY = (std::floor(y / cell) + 0.5f) * cell;
+                                         if (snapCheck->isChecked() && gridLayout().valid()) {
+                                             const GridLayout grid = gridLayout();
+                                             moveX = grid.snapX(x);
+                                             moveY = grid.snapY(y);
                                          }
                                          float sceneX = 0.0f, sceneY = 0.0f;
                                          if (canvasToScene(mapSrc.Get(), moveX, moveY, sceneX, sceneY)) {
@@ -2691,10 +2744,10 @@ RPGWindow::RPGWindow()
         if (!mapSrc.Get())
             return;
 
-        if (snapCheck->isChecked() && gridCellSpin->value() > 0) {
-            const float cell = static_cast<float>(gridCellSpin->value());
-            spawnX = (std::floor(spawnX / cell) + 0.5f) * cell;
-            spawnY = (std::floor(spawnY / cell) + 0.5f) * cell;
+        if (snapCheck->isChecked() && gridLayout().valid()) {
+            const GridLayout grid = gridLayout();
+            spawnX = grid.snapX(spawnX);
+            spawnY = grid.snapY(spawnY);
         }
 
         QString mapUuid;
@@ -2786,6 +2839,17 @@ RPGWindow::RPGWindow()
                          lastClickY = y;
                          lastClickInside = inside;
 
+                         if (gridAlignMode_) {
+                             gridAlignMode_ = false;
+                             if (inside) {
+                                 const int cell = gridCellSpin_->value();
+                                 gridOffsetXSpin_->setValue(GridLayout::wrap(int(std::lround(x)), cell));
+                                 gridOffsetYSpin_->setValue(GridLayout::wrap(int(std::lround(y)), cell));
+                                 statusBar()->showMessage(QStringLiteral("Grid aligned"), 3000);
+                             }
+                             return;
+                         }
+
                          if (!spawnMode_ && fogTool_ != FogTool::None) {
                              if (inside && currentFog_.Get()) {
                                  rpg_fog_begin_edit(currentFog_.Get());
@@ -2823,10 +2887,8 @@ RPGWindow::RPGWindow()
                                             .arg(nx, 0, 'f', 4)
                                             .arg(ny, 0, 'f', 4);
                          if (gridCheck->isChecked() && gridCellSpin->value() > 0) {
-                             const int cell = gridCellSpin->value();
-                             const int col = static_cast<int>(std::floor(x / cell));
-                             const int row = static_cast<int>(std::floor(y / cell));
-                             text += QString("  |  cell (%1, %2)").arg(col).arg(row);
+                             const GridLayout grid = gridLayout();
+                             text += QString("  |  cell (%1, %2)").arg(grid.colAt(x)).arg(grid.rowAt(y));
                          }
                          clickLabel->setText(text);
 
@@ -2891,19 +2953,74 @@ OBSSource RPGWindow::ensureGridSource()
     return gridSource_;
 }
 
-void RPGWindow::updateGridSourceSettings(obs_source_t *gridSource, int cellSize, int lineWidth,
-                                        const QColor &color)
+GridLayout RPGWindow::gridLayout() const
 {
-    if (!gridSource)
-        return;
-
     obs_video_info ovi = {};
     const bool haveVideo = obs_get_video_info(&ovi) && ovi.base_width > 0 && ovi.base_height > 0;
     const int w = haveVideo ? (int)ovi.base_width : 1920;
     const int h = haveVideo ? (int)ovi.base_height : 1080;
+    return GridLayout(gridCellSpin_ ? gridCellSpin_->value() : 50, gridWidthSpin_ ? gridWidthSpin_->value() : 1,
+                      gridOffsetXSpin_ ? gridOffsetXSpin_->value() : 0,
+                      gridOffsetYSpin_ ? gridOffsetYSpin_->value() : 0, w, h);
+}
+
+static QString GetGridSettingsPath()
+{
+    char *path = obs_module_config_path("rpg-map-effects-grid.json");
+    QString qpath = path ? QString::fromUtf8(path) : QString();
+    bfree(path);
+    return qpath;
+}
+
+void RPGWindow::loadGridSettings()
+{
+    QFile f(GetGridSettingsPath());
+    if (!f.open(QIODevice::ReadOnly))
+        return;
+    const QJsonObject o = QJsonDocument::fromJson(f.readAll()).object();
+    if (o.isEmpty())
+        return;
+    gridCellSpin_->setValue(o.value("cellSize").toInt(gridCellSpin_->value()));
+    gridWidthSpin_->setValue(o.value("lineWidth").toInt(gridWidthSpin_->value()));
+    gridOpacitySpin_->setValue(o.value("opacity").toInt(gridOpacitySpin_->value()));
+    gridOffsetXSpin_->setValue(o.value("offsetX").toInt(0));
+    gridOffsetYSpin_->setValue(o.value("offsetY").toInt(0));
+    const QColor color(o.value("color").toString());
+    if (color.isValid() && display)
+        display->setGridColor(color);
+}
+
+void RPGWindow::saveGridSettings() const
+{
+    if (!gridCellSpin_ || !gridWidthSpin_ || !gridOpacitySpin_ || !gridOffsetXSpin_ || !gridOffsetYSpin_)
+        return;
+    const QString path = GetGridSettingsPath();
+    if (path.isEmpty())
+        return;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QJsonObject o;
+    o.insert("cellSize", gridCellSpin_->value());
+    o.insert("lineWidth", gridWidthSpin_->value());
+    o.insert("opacity", gridOpacitySpin_->value());
+    o.insert("offsetX", gridOffsetXSpin_->value());
+    o.insert("offsetY", gridOffsetYSpin_->value());
+    if (display)
+        o.insert("color", display->gridColor().name(QColor::HexRgb));
+    QFile out(path);
+    if (out.open(QIODevice::WriteOnly))
+        out.write(QJsonDocument(o).toJson(QJsonDocument::Indented));
+}
+
+void RPGWindow::updateGridSourceSettings(obs_source_t *gridSource)
+{
+    if (!gridSource || !display)
+        return;
+
+    QColor color = display->gridColor();
+    color.setAlpha(std::clamp(color.alpha() * (gridOpacitySpin_ ? gridOpacitySpin_->value() : 100) / 100, 0, 255));
 
     const QString path = GetGridPngPath();
-    if (!GenerateGridPng(path, w, h, color, cellSize, lineWidth))
+    if (!GenerateGridPng(path, gridLayout(), color))
         return;
 
     obs_data_t *settings = obs_source_get_settings(gridSource);
