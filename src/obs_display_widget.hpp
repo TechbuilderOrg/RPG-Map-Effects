@@ -4,7 +4,9 @@
 #include <QString>
 #include <QColor>
 
+#include <cstdint>
 #include <mutex>
+#include <vector>
 
 class QMouseEvent;
 class ArrowOverlay;
@@ -26,6 +28,12 @@ public:
     void setGridOverlay(bool show, int cellSizePx);
     void setGridColor(const QColor &color) { gridColor_ = color; }
     void setGridLineWidth(int pixels) { gridLineWidth_ = (pixels < 1) ? 1 : ((pixels > 10) ? 10 : pixels); }
+    void setGridOffset(int x, int y)
+    {
+        gridOffsetX_ = x;
+        gridOffsetY_ = y;
+    }
+    void setGridOpacity(int percent) { gridOpacity_ = (percent < 0) ? 0 : ((percent > 100) ? 100 : percent); }
     bool gridVisible() const { return gridShow_; }
     int gridCellSize() const { return gridCellSize_; }
     int gridLineWidth() const { return gridLineWidth_; }
@@ -33,6 +41,14 @@ public:
 
     void setDirectionArrow(float fromX, float fromY, float toX, float toY);
     void clearDirectionArrow();
+
+    /** Scene item ids (in the displayed scene) of staged FX. They are hidden on output, so the
+     *  preview draws them itself as translucent "ghosts" with a marker. */
+    void setStagedItemIds(const std::vector<int64_t> &ids);
+
+    /** Fog tool overlays (preview only): round brush outline, or a rectangle being dragged. */
+    void setBrushOverlay(bool show, float x, float y, float radius);
+    void setRectOverlay(bool show, float x0, float y0, float x1, float y1);
 
     /** Convert canvas (scene) coordinates to widget coordinates for overlay drawing. */
     bool canvasToWidget(float canvasX, float canvasY, int widgetW, int widgetH,
@@ -67,6 +83,9 @@ private:
     void destroyDisplay();
 
     static void DrawCallback(void *data, uint32_t cx, uint32_t cy);
+    void drawStagedGhosts();
+    void drawGrid(uint32_t sw, uint32_t sh, float pixelsPerUnit);
+    void drawToolOverlays();
 
     obs_display_t *display = nullptr;
     obs_source_t *sceneSource = nullptr;
@@ -75,6 +94,9 @@ private:
     bool gridShow_ = false;
     int gridCellSize_ = 50;
     int gridLineWidth_ = 1;
+    int gridOffsetX_ = 0;
+    int gridOffsetY_ = 0;
+    int gridOpacity_ = 100;
     QColor gridColor_ = QColor(96, 96, 96, 255);
 
     mutable std::mutex directionArrowMutex_;
@@ -85,6 +107,34 @@ private:
     float directionArrowToY_ = 0.0f;
 
     ArrowOverlay *arrowOverlay_ = nullptr;
+
+    mutable std::mutex overlayMutex_;
+    std::vector<int64_t> stagedItemIds_;
+    bool brushShow_ = false;
+    float brushX_ = 0.0f;
+    float brushY_ = 0.0f;
+    float brushRadius_ = 0.0f;
+    bool rectShow_ = false;
+    float rectX0_ = 0.0f;
+    float rectY0_ = 0.0f;
+    float rectX1_ = 0.0f;
+    float rectY1_ = 0.0f;
+
+    // Graphics thread only (destroyed in destroyDisplay).
+    gs_texrender_t *ghostTexrender_ = nullptr;
+    gs_effect_t *ghostEffect_ = nullptr;
+    bool ghostEffectFailed_ = false;
+    struct GridCacheKey {
+        int cell = 0, lineWidth = 0, offsetX = 0, offsetY = 0, canvasW = 0, canvasH = 0;
+        float pixelsPerUnit = 0.0f;
+        bool operator==(const GridCacheKey &o) const
+        {
+            return cell == o.cell && lineWidth == o.lineWidth && offsetX == o.offsetX && offsetY == o.offsetY &&
+                   canvasW == o.canvasW && canvasH == o.canvasH && pixelsPerUnit == o.pixelsPerUnit;
+        }
+    };
+    gs_vertbuffer_t *gridVb_ = nullptr;
+    GridCacheKey gridKey_;
 
     QTimer *mousePollTimer_ = nullptr;
     bool mouseLeftDown_ = false;

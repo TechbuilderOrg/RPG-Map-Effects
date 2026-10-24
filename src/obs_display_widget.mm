@@ -3,6 +3,8 @@
 #endif
 
 #include "obs_display_widget.hpp"
+#include "rpg_fog_source.h"
+#include "grid_layout.h"
 
 #include <QHideEvent>
 #include <QMouseEvent>
@@ -15,11 +17,16 @@
 #include <QTimer>
 #include <QCursor>
 #include <QApplication>
+#include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <vector>
 
 extern "C" {
 #include <graphics/graphics.h>
+#include <graphics/matrix4.h>
+#include <graphics/vec2.h>
+#include <graphics/vec4.h>
 #include <obs-frontend-api.h>
 }
 
@@ -209,6 +216,31 @@ bool OBSDisplayWidget::getDirectionArrow(float &fromX, float &fromY, float &toX,
     return true;
 }
 
+void OBSDisplayWidget::setStagedItemIds(const std::vector<int64_t> &ids)
+{
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    stagedItemIds_ = ids;
+}
+
+void OBSDisplayWidget::setBrushOverlay(bool show, float x, float y, float radius)
+{
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    brushShow_ = show;
+    brushX_ = x;
+    brushY_ = y;
+    brushRadius_ = radius;
+}
+
+void OBSDisplayWidget::setRectOverlay(bool show, float x0, float y0, float x1, float y1)
+{
+    std::lock_guard<std::mutex> lock(overlayMutex_);
+    rectShow_ = show;
+    rectX0_ = x0;
+    rectY0_ = y0;
+    rectX1_ = x1;
+    rectY1_ = y1;
+}
+
 bool OBSDisplayWidget::canvasToWidget(float canvasX, float canvasY, int widgetW, int widgetH,
                                       int &outX, int &outY) const
 {
@@ -326,6 +358,19 @@ void OBSDisplayWidget::destroyDisplay()
     obs_display_remove_draw_callback(display, &OBSDisplayWidget::DrawCallback, this);
     obs_display_destroy(display);
     display = nullptr;
+
+    obs_enter_graphics();
+    if (ghostTexrender_)
+        gs_texrender_destroy(ghostTexrender_);
+    if (ghostEffect_)
+        gs_effect_destroy(ghostEffect_);
+    if (gridVb_)
+        gs_vertexbuffer_destroy(gridVb_);
+    obs_leave_graphics();
+    gridVb_ = nullptr;
+    ghostTexrender_ = nullptr;
+    ghostEffect_ = nullptr;
+    ghostEffectFailed_ = false;
 }
 
 void OBSDisplayWidget::setGridOverlay(bool show, int cellSizePx)
@@ -439,73 +484,207 @@ void OBSDisplayWidget::DrawCallback(void *data, uint32_t cx, uint32_t cy)
 	gs_ortho(0.0f, (float)sw, 0.0f, (float)sh, -100.0f, 100.0f);
 	gs_matrix_identity();
 
+	// Fog sources draw semi-transparent while this flag is set (GM can see under the fog).
+	rpg_set_gm_preview_rendering(true);
 	obs_source_video_render(self->sceneSource);
+	self->drawStagedGhosts();
+	rpg_set_gm_preview_rendering(false);
 
-    // Optional grid overlay in scene space (preview-only helper)
-    if (self->gridShow_ && self->gridCellSize_ > 0) {
-        const int cell = self->gridCellSize_;
-        const float w = (float)self->gridLineWidth_;
-        const float hw = w * 0.5f;
+    // Grid overlay in scene space. Same layout as the on-output grid source (which skips itself in
+    // this preview), but snapped to this view's pixels so a scaled-down grid stays even.
+    if (self->gridShow_ && self->gridCellSize_ > 0)
+        self->drawGrid(sw, sh, scale);
 
-        auto emitLineQuad = [](float x1, float y1, float x2, float y2, float halfWidth) {
-            float dx = x2 - x1;
-            float dy = y2 - y1;
-            float len = std::sqrt(dx * dx + dy * dy);
-            if (len < 1e-6f)
-                return;
-            float nx = -dy / len * halfWidth;
-            float ny = dx / len * halfWidth;
-            gs_vertex2f(x1 + nx, y1 + ny);
-            gs_vertex2f(x1 - nx, y1 - ny);
-            gs_vertex2f(x2 - nx, y2 - ny);
-            gs_vertex2f(x1 + nx, y1 + ny);
-            gs_vertex2f(x2 - nx, y2 - ny);
-            gs_vertex2f(x2 + nx, y2 + ny);
-        };
-
-        gs_render_start(true);
-        if (self->gridLineWidth_ <= 1) {
-            // 1px: draw as lines
-            for (int x = 0; x <= (int)sw; x += cell) {
-                gs_vertex2f((float)x, 0.0f);
-                gs_vertex2f((float)x, (float)sh);
-            }
-            for (int y = 0; y <= (int)sh; y += cell) {
-                gs_vertex2f(0.0f, (float)y);
-                gs_vertex2f((float)sw, (float)y);
-            }
-        } else {
-            for (int x = 0; x <= (int)sw; x += cell)
-                emitLineQuad((float)x, 0.0f, (float)x, (float)sh, hw);
-            for (int y = 0; y <= (int)sh; y += cell)
-                emitLineQuad(0.0f, (float)y, (float)sw, (float)y, hw);
-        }
-
-        gs_vertbuffer_t *vb = gs_render_save();
-        if (vb) {
-            gs_load_vertexbuffer(vb);
-            gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-            gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
-
-            const QColor c = self->gridColor_;
-            const uint32_t argb =
-                (uint32_t(c.alpha()) << 24) | (uint32_t(c.red()) << 16) |
-                (uint32_t(c.green()) << 8) | uint32_t(c.blue());
-
-            gs_effect_set_color(color, argb);
-            while (gs_effect_loop(solid, "Solid")) {
-                if (self->gridLineWidth_ <= 1)
-                    gs_draw(GS_LINES, 0, 0);
-                else
-                    gs_draw(GS_TRIS, 0, 0);
-            }
-            gs_vertexbuffer_destroy(vb);
-        }
-    }
+	self->drawToolOverlays();
 
 	gs_matrix_pop();
 	gs_projection_pop();
 	gs_viewport_pop();
+}
+
+/** Draw a closed polyline / circle outline in canvas space with the solid effect. */
+static void DrawSolidLineStrip(const std::vector<vec2> &pts, uint32_t argb)
+{
+    if (pts.size() < 2)
+        return;
+    gs_render_start(true);
+    for (const vec2 &p : pts)
+        gs_vertex2f(p.x, p.y);
+    gs_vertbuffer_t *vb = gs_render_save();
+    if (!vb)
+        return;
+    gs_load_vertexbuffer(vb);
+    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), argb);
+    while (gs_effect_loop(solid, "Solid"))
+        gs_draw(GS_LINESTRIP, 0, 0);
+    gs_load_vertexbuffer(nullptr);
+    gs_vertexbuffer_destroy(vb);
+}
+
+static std::vector<vec2> CirclePoints(float cx, float cy, float r, int segments = 64)
+{
+    std::vector<vec2> pts;
+    pts.reserve(size_t(segments) + 1);
+    for (int i = 0; i <= segments; ++i) {
+        const float a = float(i) / float(segments) * 6.2831853f;
+        vec2 p;
+        vec2_set(&p, cx + std::cos(a) * r, cy + std::sin(a) * r);
+        pts.push_back(p);
+    }
+    return pts;
+}
+
+void OBSDisplayWidget::drawGrid(uint32_t sw, uint32_t sh, float pixelsPerUnit)
+{
+    const GridLayout grid(gridCellSize_, gridLineWidth_, gridOffsetX_, gridOffsetY_, int(sw), int(sh));
+    if (!grid.valid())
+        return;
+
+    const GridCacheKey key{grid.cell, grid.lineWidth, grid.offsetX, grid.offsetY, grid.canvasW, grid.canvasH,
+                           pixelsPerUnit};
+    if (!gridVb_ || !(key == gridKey_)) {
+        if (gridVb_)
+            gs_vertexbuffer_destroy(gridVb_);
+        gs_render_start(true);
+        ForEachGridRect(grid, pixelsPerUnit, [](float x0, float y0, float x1, float y1) {
+            gs_vertex2f(x0, y0);
+            gs_vertex2f(x1, y0);
+            gs_vertex2f(x0, y1);
+            gs_vertex2f(x1, y0);
+            gs_vertex2f(x1, y1);
+            gs_vertex2f(x0, y1);
+        });
+        gridVb_ = gs_render_save();
+        gridKey_ = key;
+    }
+    if (!gridVb_)
+        return;
+
+    const QColor c = gridColor_;
+    const int alpha = std::clamp(c.alpha() * gridOpacity_ / 100, 0, 255);
+    const uint32_t argb = (uint32_t(alpha) << 24) | (uint32_t(c.red()) << 16) | (uint32_t(c.green()) << 8) |
+                          uint32_t(c.blue());
+
+    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), argb);
+    gs_load_vertexbuffer(gridVb_);
+    gs_load_indexbuffer(nullptr);
+    gs_blend_state_push();
+    gs_enable_blending(true);
+    gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+    while (gs_effect_loop(solid, "Solid"))
+        gs_draw(GS_TRIS, 0, 0);
+    gs_blend_state_pop();
+    gs_load_vertexbuffer(nullptr);
+}
+
+void OBSDisplayWidget::drawStagedGhosts()
+{
+    std::vector<int64_t> ids;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        ids = stagedItemIds_;
+    }
+    if (ids.empty() || !sceneSource)
+        return;
+    obs_scene_t *scene = obs_scene_from_source(sceneSource);
+    if (!scene)
+        return;
+
+    if (!ghostEffect_ && !ghostEffectFailed_) {
+        ghostEffect_ = rpg_create_effect();
+        ghostEffectFailed_ = !ghostEffect_;
+    }
+    if (!ghostTexrender_)
+        ghostTexrender_ = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+
+    static constexpr uint32_t kStagedColor = 0xFFFFA000; // amber (ARGB)
+
+    for (int64_t id : ids) {
+        obs_sceneitem_t *item = obs_scene_find_sceneitem_by_id(scene, id);
+        if (!item)
+            continue;
+        obs_source_t *src = obs_sceneitem_get_source(item);
+        const uint32_t w = src ? obs_source_get_width(src) : 0;
+        const uint32_t h = src ? obs_source_get_height(src) : 0;
+
+        if (ghostEffect_ && ghostTexrender_ && w > 0 && h > 0) {
+            // Render the hidden FX into a texture, then draw it translucent with the item's transform.
+            gs_texrender_reset(ghostTexrender_);
+            if (gs_texrender_begin(ghostTexrender_, w, h)) {
+                vec4 zero;
+                vec4_zero(&zero);
+                gs_clear(GS_CLEAR_COLOR, &zero, 0.0f, 0);
+                gs_ortho(0.0f, float(w), 0.0f, float(h), -100.0f, 100.0f);
+                gs_blend_state_push();
+                gs_blend_function_separate(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA, GS_BLEND_ONE,
+                                           GS_BLEND_INVSRCALPHA);
+                obs_source_video_render(src);
+                gs_blend_state_pop();
+                gs_texrender_end(ghostTexrender_);
+
+                gs_texture_t *tex = gs_texrender_get_texture(ghostTexrender_);
+                if (tex) {
+                    matrix4 m;
+                    obs_sceneitem_get_draw_transform(item, &m);
+                    gs_matrix_push();
+                    gs_matrix_mul(&m);
+                    gs_blend_state_push();
+                    gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+                    gs_effect_set_texture(gs_effect_get_param_by_name(ghostEffect_, "image"), tex);
+                    gs_effect_set_float(gs_effect_get_param_by_name(ghostEffect_, "opacity"), 0.55f);
+                    while (gs_effect_loop(ghostEffect_, "DrawOpacity"))
+                        gs_draw_sprite(tex, 0, w, h);
+                    gs_blend_state_pop();
+                    gs_matrix_pop();
+                }
+            }
+        }
+
+        // Marker at the FX anchor (FX items are center-aligned) so even invisible content is findable.
+        vec2 pos;
+        obs_sceneitem_get_pos(item, &pos);
+        DrawSolidLineStrip(CirclePoints(pos.x, pos.y, 26.0f, 32), kStagedColor);
+        DrawSolidLineStrip(CirclePoints(pos.x, pos.y, 30.0f, 32), kStagedColor);
+        vec2 a, b;
+        vec2_set(&a, pos.x - 12.0f, pos.y);
+        vec2_set(&b, pos.x + 12.0f, pos.y);
+        DrawSolidLineStrip({a, b}, kStagedColor);
+        vec2_set(&a, pos.x, pos.y - 12.0f);
+        vec2_set(&b, pos.x, pos.y + 12.0f);
+        DrawSolidLineStrip({a, b}, kStagedColor);
+    }
+}
+
+void OBSDisplayWidget::drawToolOverlays()
+{
+    bool brushShow, rectShow;
+    float bx, by, br, x0, y0, x1, y1;
+    {
+        std::lock_guard<std::mutex> lock(overlayMutex_);
+        brushShow = brushShow_;
+        bx = brushX_;
+        by = brushY_;
+        br = brushRadius_;
+        rectShow = rectShow_;
+        x0 = rectX0_;
+        y0 = rectY0_;
+        x1 = rectX1_;
+        y1 = rectY1_;
+    }
+    static constexpr uint32_t kToolColor = 0xFF40E0FF; // cyan (ARGB)
+    if (brushShow && br > 0.0f)
+        DrawSolidLineStrip(CirclePoints(bx, by, br), kToolColor);
+    if (rectShow) {
+        std::vector<vec2> pts(5);
+        vec2_set(&pts[0], x0, y0);
+        vec2_set(&pts[1], x1, y0);
+        vec2_set(&pts[2], x1, y1);
+        vec2_set(&pts[3], x0, y1);
+        pts[4] = pts[0];
+        DrawSolidLineStrip(pts, kToolColor);
+    }
 }
 
 void OBSDisplayWidget::mousePressEvent(QMouseEvent *e)

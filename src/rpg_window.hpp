@@ -2,10 +2,13 @@
 #include <QColor>
 #include <QMap>
 #include <QMainWindow>
+#include <QSet>
 #include <QString>
 #include <vector>
 
 #include <obs.hpp>
+
+#include "grid_layout.h"
 
 class OBSDisplayWidget;
 class QCheckBox;
@@ -13,6 +16,10 @@ class QComboBox;
 class QFrame;
 class QLabel;
 class QListWidget;
+class QListWidgetItem;
+class QPushButton;
+class QRadioButton;
+class QSpinBox;
 class QToolButton;
 class QLineEdit;
 class QTimer;
@@ -25,10 +32,19 @@ public:
 
     /** Release OBS resources (display, scene ref). Call on OBS_FRONTEND_EVENT_EXIT to avoid shutdown crash. */
     void releaseOBSResources();
+    /** Drop our strong refs to sources of the current scene collection so OBS can free them
+     *  (OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP: exit or switching collections). */
+    void releaseSceneCollectionRefs();
+
+    /** Reveal every staged FX on the current battlemap (toolbar button and hotkey). */
+    void triggerAllStaged();
+    /** Reveal the first staged FX (in list order) on the current battlemap. */
+    void triggerNextStaged();
 
 private:
     OBSSource ensureGridSource();
-    void updateGridSourceSettings(obs_source_t *gridSource, int cellSize, int lineWidth, const QColor &color);
+    /** Push the current grid settings to the on-output grid source. */
+    void updateGridSourceSettings(obs_source_t *gridSource);
     void syncGridOutputToScene(const QString &sceneName, bool showOnOutput);
 
     struct FxInstance {
@@ -38,11 +54,32 @@ private:
         QString label;        // user-visible label text on the map
         QString templateName; // template scene name used for this instance
         bool locked = false;  // when true, excluded from Clear all
+        /** Staged FX are placed on the map but hidden on output until triggered. The GM preview
+         *  draws them as translucent ghosts so they can be moved / rotated / resized first. */
+        bool staged = false;
+        // Spawn settings remembered so a staged FX plays exactly as configured when triggered.
+        bool sequence = true;
+        int lifetimeSec = 0;
+        int fadeMs = 600;
     };
     static bool sameFx(const FxInstance &a, const FxInstance &b);
 
 private:
     OBSDisplayWidget *display = nullptr;
+
+    // Grid settings (toolbar). Saved to the module config so they survive restarts.
+    QSpinBox *gridCellSpin_ = nullptr;
+    QSpinBox *gridWidthSpin_ = nullptr;
+    QSpinBox *gridOpacitySpin_ = nullptr;
+    QSpinBox *gridOffsetXSpin_ = nullptr;
+    QSpinBox *gridOffsetYSpin_ = nullptr;
+    QFrame *gridAlignPopup_ = nullptr;
+    /** Next left click on the map sets the grid offset so a grid corner lands there. */
+    bool gridAlignMode_ = false;
+    /** Layout of the grid on the current canvas (shared by output image, preview and snapping). */
+    GridLayout gridLayout() const;
+    void loadGridSettings();
+    void saveGridSettings() const;
 
     QColor labelColor_ = Qt::white;
 
@@ -108,4 +145,49 @@ private:
     bool scenePosToCanvas(obs_source_t *mapSource, float posX, float posY, float &outCX, float &outCY) const;
     /** Clear the FX at the given list row: fade out, remove from store/list, release lock. */
     void clearFxAtRow(int row, int fadeMs);
+
+    // --- Staged FX ---
+    /** Reveal a staged FX on output (runs its sequence, starts its lifetime). */
+    void triggerFx(const FxInstance &inst);
+    /** Fade out and remove the FX after lifetimeSec (if it still exists then). */
+    void scheduleLifetime(const FxInstance &inst, int lifetimeSec, int fadeMs);
+    /** Drop the preview "showing" reference held while an FX is staged. */
+    void releaseStagedShowing(const QString &effectUuid);
+    /** Push staged FX of the current map to the preview and refresh trigger button / list tags. */
+    void updateStagedOverlay();
+    QListWidgetItem *makeFxListItem(const FxInstance &inst) const;
+    /** Effect UUIDs whose FX source we called obs_source_inc_showing on while staged. */
+    QSet<QString> stagedShowingUuids_;
+    QPushButton *triggerAllBtn_ = nullptr;
+    QPushButton *triggerSelectedBtn_ = nullptr;
+
+    // --- Fog of war ---
+    enum class FogTool { None, Brush, Rect };
+    FogTool fogTool_ = FogTool::None;
+    bool fogStrokeActive_ = false;
+    float fogLastX_ = 0.0f;
+    float fogLastY_ = 0.0f;
+    float fogRectX0_ = 0.0f;
+    float fogRectY0_ = 0.0f;
+    float fogRectX1_ = 0.0f;
+    float fogRectY1_ = 0.0f;
+    /** Fog source of the current battlemap (empty when the map has no fog). */
+    OBSSource currentFog_;
+    QCheckBox *fogEnableCheck_ = nullptr;
+    QPushButton *fogBrushBtn_ = nullptr;
+    QPushButton *fogRectBtn_ = nullptr;
+    QRadioButton *fogRevealRadio_ = nullptr;
+    QSpinBox *fogBrushSpin_ = nullptr;
+    QSpinBox *fogGmOpacitySpin_ = nullptr;
+    QToolButton *fogColorBtn_ = nullptr;
+
+    /** Find (and optionally create + add) the fog source in the current battlemap scene. */
+    OBSSource fogSourceForCurrentMap(bool create);
+    /** Show or hide fog on the current battlemap (creating the fog source on first use). */
+    void setFogEnabledForCurrentMap(bool enabled);
+    /** Refresh currentFog_ and the fog controls after switching battlemaps. */
+    void syncFogUiForCurrentMap();
+    void setFogTool(FogTool tool);
+    bool fogRevealMode() const;
+    void setFogSetting(const char *name, long long value);
 };

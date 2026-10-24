@@ -34,9 +34,18 @@ add_custom_command(
 target_sources(rpg-map-effects PRIVATE
   src/plugin-main.cpp
   src/rpg_window.cpp
+  src/rpg_fog_source.cpp
+  src/rpg_grid_source.cpp
   src/obs_display_widget.mm
   "${CURSOR_ASSETS_GENERATED}"
 )
+
+if(NOT APPLE)
+  set_source_files_properties(src/obs_display_widget.mm PROPERTIES LANGUAGE CXX)
+  if(MSVC)
+    set_source_files_properties(src/obs_display_widget.mm PROPERTIES COMPILE_OPTIONS /TP)
+  endif()
+endif()
 
 target_include_directories(rpg-map-effects PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
