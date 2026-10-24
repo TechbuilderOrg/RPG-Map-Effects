@@ -364,7 +364,10 @@ void OBSDisplayWidget::destroyDisplay()
         gs_texrender_destroy(ghostTexrender_);
     if (ghostEffect_)
         gs_effect_destroy(ghostEffect_);
+    if (gridVb_)
+        gs_vertexbuffer_destroy(gridVb_);
     obs_leave_graphics();
+    gridVb_ = nullptr;
     ghostTexrender_ = nullptr;
     ghostEffect_ = nullptr;
     ghostEffectFailed_ = false;
@@ -487,53 +490,10 @@ void OBSDisplayWidget::DrawCallback(void *data, uint32_t cx, uint32_t cy)
 	self->drawStagedGhosts();
 	rpg_set_gm_preview_rendering(false);
 
-    // Optional grid overlay in scene space (preview-only helper). Same layout as the output grid image.
-    if (self->gridShow_ && self->gridCellSize_ > 0) {
-        const GridLayout grid(self->gridCellSize_, self->gridLineWidth_, self->gridOffsetX_, self->gridOffsetY_,
-                              int(sw), int(sh));
-        if (grid.valid()) {
-            auto emitRect = [](float x0, float y0, float x1, float y1) {
-                gs_vertex2f(x0, y0);
-                gs_vertex2f(x1, y0);
-                gs_vertex2f(x0, y1);
-                gs_vertex2f(x1, y0);
-                gs_vertex2f(x1, y1);
-                gs_vertex2f(x0, y1);
-            };
-            const float w = float(grid.lineWidth);
-            const float top = float(grid.lineY(0)), bottom = float(grid.bottom());
-            const float left = float(grid.lineX(0)), right = float(grid.right());
-
-            gs_render_start(true);
-            for (int k = 0; k <= grid.cols(); ++k)
-                emitRect(float(grid.lineX(k)), top, float(grid.lineX(k)) + w, bottom);
-            for (int k = 0; k <= grid.rows(); ++k)
-                emitRect(left, float(grid.lineY(k)), right, float(grid.lineY(k)) + w);
-
-            gs_vertbuffer_t *vb = gs_render_save();
-            if (vb) {
-                gs_load_vertexbuffer(vb);
-                gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
-                gs_eparam_t *color = gs_effect_get_param_by_name(solid, "color");
-
-                const QColor c = self->gridColor_;
-                const int alpha = std::clamp(c.alpha() * self->gridOpacity_ / 100, 0, 255);
-                const uint32_t argb =
-                    (uint32_t(alpha) << 24) | (uint32_t(c.red()) << 16) |
-                    (uint32_t(c.green()) << 8) | uint32_t(c.blue());
-
-                gs_effect_set_color(color, argb);
-                gs_blend_state_push();
-                gs_enable_blending(true);
-                gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
-                while (gs_effect_loop(solid, "Solid"))
-                    gs_draw(GS_TRIS, 0, 0);
-                gs_blend_state_pop();
-                gs_load_vertexbuffer(nullptr);
-                gs_vertexbuffer_destroy(vb);
-            }
-        }
-    }
+    // Grid overlay in scene space. Same layout as the on-output grid source (which skips itself in
+    // this preview), but snapped to this view's pixels so a scaled-down grid stays even.
+    if (self->gridShow_ && self->gridCellSize_ > 0)
+        self->drawGrid(sw, sh, scale);
 
 	self->drawToolOverlays();
 
@@ -573,6 +533,50 @@ static std::vector<vec2> CirclePoints(float cx, float cy, float r, int segments 
         pts.push_back(p);
     }
     return pts;
+}
+
+void OBSDisplayWidget::drawGrid(uint32_t sw, uint32_t sh, float pixelsPerUnit)
+{
+    const GridLayout grid(gridCellSize_, gridLineWidth_, gridOffsetX_, gridOffsetY_, int(sw), int(sh));
+    if (!grid.valid())
+        return;
+
+    const GridCacheKey key{grid.cell, grid.lineWidth, grid.offsetX, grid.offsetY, grid.canvasW, grid.canvasH,
+                           pixelsPerUnit};
+    if (!gridVb_ || !(key == gridKey_)) {
+        if (gridVb_)
+            gs_vertexbuffer_destroy(gridVb_);
+        gs_render_start(true);
+        ForEachGridRect(grid, pixelsPerUnit, [](float x0, float y0, float x1, float y1) {
+            gs_vertex2f(x0, y0);
+            gs_vertex2f(x1, y0);
+            gs_vertex2f(x0, y1);
+            gs_vertex2f(x1, y0);
+            gs_vertex2f(x1, y1);
+            gs_vertex2f(x0, y1);
+        });
+        gridVb_ = gs_render_save();
+        gridKey_ = key;
+    }
+    if (!gridVb_)
+        return;
+
+    const QColor c = gridColor_;
+    const int alpha = std::clamp(c.alpha() * gridOpacity_ / 100, 0, 255);
+    const uint32_t argb = (uint32_t(alpha) << 24) | (uint32_t(c.red()) << 16) | (uint32_t(c.green()) << 8) |
+                          uint32_t(c.blue());
+
+    gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+    gs_effect_set_color(gs_effect_get_param_by_name(solid, "color"), argb);
+    gs_load_vertexbuffer(gridVb_);
+    gs_load_indexbuffer(nullptr);
+    gs_blend_state_push();
+    gs_enable_blending(true);
+    gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
+    while (gs_effect_loop(solid, "Solid"))
+        gs_draw(GS_TRIS, 0, 0);
+    gs_blend_state_pop();
+    gs_load_vertexbuffer(nullptr);
 }
 
 void OBSDisplayWidget::drawStagedGhosts()

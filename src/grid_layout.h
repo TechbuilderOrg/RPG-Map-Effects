@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <vector>
 
 /**
  * Grid geometry shared by the output grid image, the preview grid, snapping and the cell readout,
@@ -81,3 +82,35 @@ struct GridLayout {
         y1 = float(lineY(r1) + lineWidth);
     }
 };
+
+/**
+ * Emit the grid's line rectangles (canvas units) for drawing at `pixelsPerUnit` screen pixels per
+ * canvas pixel. Every line edge is snapped to a whole screen pixel and lines are at least one
+ * screen pixel wide, so a scaled-down grid keeps evenly spaced, equally visible lines (spacing
+ * varies by at most one screen pixel) instead of thin lines vanishing between pixels. At 1.0 this
+ * is the exact canvas grid. Horizontal lines are split at the vertical lines so translucent lines
+ * do not overlap at the crossings. Calls rect(x0, y0, x1, y1). (Not named "emit": Qt defines that as a
+ * macro.)
+ */
+template<class RectFn> void ForEachGridRect(const GridLayout &grid, float pixelsPerUnit, RectFn &&rect)
+{
+    if (!grid.valid() || pixelsPerUnit <= 0.0f)
+        return;
+    const float s = pixelsPerUnit;
+    const float lw = std::max(1.0f, std::round(float(grid.lineWidth) * s)) / s;
+    std::vector<float> xs(size_t(grid.cols()) + 1), ys(size_t(grid.rows()) + 1);
+    for (int k = 0; k <= grid.cols(); ++k)
+        xs[size_t(k)] = std::round(float(grid.lineX(k)) * s) / s;
+    for (int k = 0; k <= grid.rows(); ++k)
+        ys[size_t(k)] = std::round(float(grid.lineY(k)) * s) / s;
+
+    const float top = ys.front(), bottom = ys.back() + lw;
+    for (float x : xs)
+        rect(x, top, x + lw, bottom);
+    for (float y : ys) {
+        for (size_t k = 0; k + 1 < xs.size(); ++k) {
+            if (xs[k + 1] > xs[k] + lw)
+                rect(xs[k] + lw, y, xs[k + 1], y + lw);
+        }
+    }
+}

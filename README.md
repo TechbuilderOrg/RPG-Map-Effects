@@ -49,9 +49,13 @@ https://www.youtube.com/watch?v=U_O7mSwl27I
   - Snap to grid, the fog rectangle tool and the cell readout use the same layout.
   - Grid settings are remembered between sessions.
   - **Show grid on output**:
-    - Creates/ensures an image source named `RPG Map Grid`.
-    - Renders a PNG at the base canvas size and adds it as a source to the selected battlemap scene.
-    - Places the grid source on top of other sources.
+    - Creates/ensures an `RPG Map Grid` source (an RPG Map Effects grid source; an image grid left over
+      from older versions is hidden) and adds it to the selected battlemap scene.
+    - The grid is drawn as geometry at the full canvas resolution (sharp on 4K canvases); the plugin
+      window draws the same grid snapped to its own pixels, so lines never vanish when the canvas is
+      scaled down to fit the window. OBS's own preview panel still shrinks the canvas, so judge the grid
+      in the plugin window or on the stream.
+    - Places the grid on top of the map and FX, below fog of war and the cursor.
     - Checkbox on → grid visible; off → grid hidden (item stays in the scene).
     - 
 <img width="273" height="315" alt="SCR-20260305-mqik" src="https://github.com/user-attachments/assets/004b7fba-ed1f-4fe9-be2b-efc5d3706004" />

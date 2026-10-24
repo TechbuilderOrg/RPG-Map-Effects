@@ -43,7 +43,7 @@ public:
 
 private:
     OBSSource ensureGridSource();
-    /** Regenerate the output grid image from the current grid settings and reload the grid source. */
+    /** Push the current grid settings to the on-output grid source. */
     void updateGridSourceSettings(obs_source_t *gridSource);
     void syncGridOutputToScene(const QString &sceneName, bool showOnOutput);
 

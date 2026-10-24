@@ -8,6 +8,7 @@
 
 #include "rpg_window.hpp"
 #include "rpg_fog_source.h"
+#include "rpg_grid_source.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("rpg-map-effects", "en-US")
@@ -97,6 +98,7 @@ static void on_frontend_event(enum obs_frontend_event event, void *)
 bool obs_module_load(void)
 {
     rpg_fog_register_source();
+    rpg_grid_register_source();
 
     g_triggerAllHotkey = obs_hotkey_register_frontend("rpg_map_effects.trigger_all_staged",
                                                       "RPG Map Effects: Trigger all staged FX",

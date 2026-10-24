@@ -32,6 +32,7 @@ if(TARGET OBS::libobs)
     src/plugin-main.cpp
     src/rpg_window.cpp
     src/rpg_fog_source.cpp
+    src/rpg_grid_source.cpp
     src/obs_display_widget.mm
     "${CURSOR_ASSETS_GENERATED}"
   )
@@ -136,6 +137,7 @@ else()
     src/plugin-main.cpp
     src/rpg_window.cpp
     src/rpg_fog_source.cpp
+    src/rpg_grid_source.cpp
     src/obs_display_widget.mm
     "${CURSOR_ASSETS_GENERATED}"
   )

@@ -2,6 +2,7 @@
 #include "obs_display_widget.hpp"
 #include "cursor_assets.h"
 #include "rpg_fog_source.h"
+#include "rpg_grid_source.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -469,45 +470,6 @@ static void RestartMediaForSceneItem(obs_sceneitem_t *item)
 static const char *kGridSourceName = "RPG Map Grid";
 static const char *kCursorSourceName = "RPG Map Cursor";
 
-static QString GetGridPngPath()
-{
-    return QDir::temp().absoluteFilePath(QStringLiteral("rpg_map_effects_grid.png"));
-}
-
-/** Render the output grid image: full-width line bands around whole squares only (see GridLayout). */
-static bool GenerateGridPng(const QString &path, const GridLayout &grid, const QColor &color)
-{
-    if (grid.canvasW < 1 || grid.canvasH < 1 || grid.cell < 10 || grid.lineWidth < 1 || grid.lineWidth > 10)
-        return false;
-
-    QImage img(grid.canvasW, grid.canvasH, QImage::Format_ARGB32);
-    img.fill(Qt::transparent);
-
-    if (grid.valid()) {
-        QPainter p(&img);
-        p.setRenderHint(QPainter::Antialiasing, false);
-        // Source mode: overlapping bands at the crossings keep the chosen opacity instead of doubling it.
-        p.setCompositionMode(QPainter::CompositionMode_Source);
-        const int top = grid.lineY(0), height = grid.bottom() - top;
-        const int left = grid.lineX(0), width = grid.right() - left;
-        for (int k = 0; k <= grid.cols(); ++k)
-            p.fillRect(grid.lineX(k), top, grid.lineWidth, height, color);
-        for (int k = 0; k <= grid.rows(); ++k)
-            p.fillRect(left, grid.lineY(k), width, grid.lineWidth, color);
-        p.end();
-    }
-
-    return img.save(path, "PNG");
-}
-
-/** Write a 1x1 transparent PNG so the grid source shows nothing when "Show grid on output" is off. */
-static bool WriteBlankGridPng(const QString &path)
-{
-    QImage img(1, 1, QImage::Format_ARGB32);
-    img.fill(Qt::transparent);
-    return img.save(path, "PNG");
-}
-
 /** Find or add grid in the given scene and set visibility. Uses atomic update like the frontend. */
 struct GridSceneItemCtx {
     obs_source_t *gridSource = nullptr;
@@ -551,6 +513,24 @@ struct AddGridToSceneData {
     bool visible = false;
 };
 
+static void RaiseOverlaysInSceneLocked(obs_scene_t *scene);
+
+/** The grid used to be an image_source with this name; hide it so it doesn't double the grid source. */
+static void HideLegacyGridImageLocked(obs_scene_t *scene)
+{
+    obs_scene_enum_items(
+        scene,
+        [](obs_scene_t *, obs_sceneitem_t *item, void *) {
+            obs_source_t *src = obs_sceneitem_get_source(item);
+            const char *id = src ? obs_source_get_unversioned_id(src) : nullptr;
+            const char *nm = src ? obs_source_get_name(src) : nullptr;
+            if (id && nm && strcmp(id, "image_source") == 0 && strcmp(nm, kGridSourceName) == 0)
+                obs_sceneitem_set_visible(item, false);
+            return true;
+        },
+        nullptr);
+}
+
 static void AddOrShowGridInSceneHelper(void *param, obs_scene_t *scene)
 {
     auto *data = static_cast<AddGridToSceneData *>(param);
@@ -561,19 +541,26 @@ static void AddOrShowGridInSceneHelper(void *param, obs_scene_t *scene)
     ctx.gridSource = data->gridSource;
     obs_scene_enum_items(scene, findGridItemInScene, &ctx);
 
+    if (data->visible)
+        HideLegacyGridImageLocked(scene);
+
     if (ctx.item) {
         obs_sceneitem_set_visible(ctx.item, data->visible);
-        if (data->visible)
+        if (data->visible) {
             obs_sceneitem_set_order(ctx.item, OBS_ORDER_MOVE_TOP);
+            RaiseOverlaysInSceneLocked(scene);
+        }
         obs_sceneitem_release(ctx.item);
         return;
     }
 
     obs_sceneitem_t *item = obs_scene_add(scene, data->gridSource);
     if (item) {
+        // The grid is drawn in canvas coordinates; keep it from being dragged around.
+        obs_sceneitem_set_locked(item, true);
         obs_sceneitem_set_visible(item, data->visible);
         obs_sceneitem_set_order(item, OBS_ORDER_MOVE_TOP);
-        obs_sceneitem_release(item);
+        RaiseOverlaysInSceneLocked(scene);
     }
 }
 
@@ -1721,9 +1708,9 @@ RPGWindow::RPGWindow()
     statusBar()->addPermanentWidget(verLabel, 0);
 
     auto updateGridOverlay = [this, gridCheck, gridCellSpin, gridWidthSpin, gridOnOutputCheck]() {
-        // With the grid on output, the preview already shows that grid; drawing the preview grid
-        // on top would double the lines and make them look more opaque than on stream.
-        display->setGridOverlay(gridCheck->isChecked() && !gridOnOutputCheck->isChecked(), gridCellSpin->value());
+        // The on-output grid source skips this preview; the preview draws the same grid itself,
+        // snapped to its own pixels so it stays even when a large canvas is scaled down.
+        display->setGridOverlay(gridCheck->isChecked() || gridOnOutputCheck->isChecked(), gridCellSpin->value());
         display->setGridLineWidth(gridWidthSpin->value());
         display->setGridOpacity(gridOpacitySpin_->value());
         display->setGridOffset(gridOffsetXSpin_->value(), gridOffsetYSpin_->value());
@@ -2935,21 +2922,23 @@ OBSSource RPGWindow::ensureGridSource()
     if (gridSource_.Get())
         return gridSource_;
 
-    obs_source_t *existing = obs_get_source_by_name(kGridSourceName);
-    if (existing) {
-        gridSource_ = OBSSource(existing);
-        obs_source_release(existing);
-        return gridSource_;
+    // Reuse our grid source if it exists. Older versions made an image_source with the same name;
+    // that one is left alone (and hidden in the map scene) and the new source gets another name.
+    QString name = QString::fromUtf8(kGridSourceName);
+    for (int n = 2;; ++n) {
+        OBSSourceAutoRelease existing(obs_get_source_by_name(name.toUtf8().constData()));
+        if (!existing.Get())
+            break;
+        if (rpg_is_grid_source(existing.Get())) {
+            gridSource_ = OBSSource(existing.Get());
+            return gridSource_;
+        }
+        name = QStringLiteral("%1 %2").arg(QString::fromUtf8(kGridSourceName)).arg(n);
     }
 
-    obs_data_t *settings = obs_data_create();
-    obs_data_set_string(settings, "file", GetGridPngPath().toUtf8().constData());
-    obs_data_set_bool(settings, "unload", false);
-
-    obs_source_t *src = obs_source_create("image_source", kGridSourceName, settings, nullptr);
-    obs_data_release(settings);
-    if (src)
-        gridSource_ = OBSSource(src);
+    OBSSourceAutoRelease src(obs_source_create(RPG_GRID_SOURCE_ID, name.toUtf8().constData(), nullptr, nullptr));
+    if (src.Get())
+        gridSource_ = OBSSource(src.Get());
     return gridSource_;
 }
 
@@ -3013,22 +3002,21 @@ void RPGWindow::saveGridSettings() const
 
 void RPGWindow::updateGridSourceSettings(obs_source_t *gridSource)
 {
-    if (!gridSource || !display)
+    if (!gridSource || !display || !gridCellSpin_)
         return;
 
-    QColor color = display->gridColor();
-    color.setAlpha(std::clamp(color.alpha() * (gridOpacitySpin_ ? gridOpacitySpin_->value() : 100) / 100, 0, 255));
-
-    const QString path = GetGridPngPath();
-    if (!GenerateGridPng(path, gridLayout(), color))
-        return;
-
-    obs_data_t *settings = obs_source_get_settings(gridSource);
-    if (!settings)
-        return;
-    obs_data_set_string(settings, "file", path.toUtf8().constData());
+    const QColor c = display->gridColor();
+    // OBS color properties are 0xAABBGGRR.
+    const uint32_t abgr = (uint32_t(c.alpha()) << 24) | (uint32_t(c.blue()) << 16) | (uint32_t(c.green()) << 8) |
+                          uint32_t(c.red());
+    OBSDataAutoRelease settings = obs_data_create();
+    obs_data_set_int(settings, "cell_size", gridCellSpin_->value());
+    obs_data_set_int(settings, "line_width", gridWidthSpin_->value());
+    obs_data_set_int(settings, "offset_x", gridOffsetXSpin_->value());
+    obs_data_set_int(settings, "offset_y", gridOffsetYSpin_->value());
+    obs_data_set_int(settings, "color", abgr);
+    obs_data_set_int(settings, "opacity", gridOpacitySpin_->value());
     obs_source_update(gridSource, settings);
-    obs_data_release(settings);
 }
 
 void RPGWindow::syncGridOutputToScene(const QString &sceneName, bool showOnOutput)
@@ -3045,18 +3033,6 @@ void RPGWindow::syncGridOutputToScene(const QString &sceneName, bool showOnOutpu
         return;
 
     addGridToSceneAndSetVisible(scene, gridSource_.Get(), showOnOutput);
-
-    if (!showOnOutput) {
-        const QString path = GetGridPngPath();
-        if (WriteBlankGridPng(path)) {
-            obs_data_t *settings = obs_source_get_settings(gridSource_.Get());
-            if (settings) {
-                obs_data_set_string(settings, "file", path.toUtf8().constData());
-                obs_source_update(gridSource_.Get(), settings);
-                obs_data_release(settings);
-            }
-        }
-    }
 }
 
 QString RPGWindow::selectedCursorFilename() const
